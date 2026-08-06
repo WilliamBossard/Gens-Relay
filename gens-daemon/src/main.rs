@@ -23,6 +23,18 @@ use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 
+static DOWNLOAD_DIR: std::sync::OnceLock<std::sync::Mutex<String>> = std::sync::OnceLock::new();
+
+fn get_download_dir() -> String {
+    DOWNLOAD_DIR.get_or_init(|| std::sync::Mutex::new("downloads".to_string()))
+        .lock().unwrap().clone()
+}
+
+fn set_download_dir(dir: String) {
+    *DOWNLOAD_DIR.get_or_init(|| std::sync::Mutex::new("downloads".to_string()))
+        .lock().unwrap() = dir;
+}
+
 #[derive(Deserialize, Debug)]
 #[serde(tag = "type")]
 enum ServerMessage {
@@ -446,6 +458,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         };
                         let _ = state.ipc_tx.send(serde_json::to_string(&event).unwrap());
                     }
+                    "set_download_dir" => {
+                        if let Some(path) = cmd.path {
+                            set_download_dir(path.clone());
+                            println!("[Daemon] Download directory set to: {}", path);
+                        }
+                    }
                     action @ "connect" | action @ "p2p" | action @ "sendfile" | action @ "ls" | action @ "download_req" | action @ "add_peer" => {
                         if let Some(raw_target) = cmd.target {
                             let target_id = resolve_target(&raw_target, &state_console).await;
@@ -801,10 +819,11 @@ async fn setup_data_channel(data_channel: &Arc<RTCDataChannel>, target_id: Strin
                                                             if let Some(name) = inner_json.get("name").and_then(|n| n.as_str()) {
                                                                 println!("[File] Starting secure reception: {} from {}...", name, target2);
                                                                 let safe_name = name.replace("..", "").replace("/", "").replace("\\", "");
-                                                                let _ = fs::create_dir_all("downloads").await;
-                                                                let path = format!("downloads/{}", safe_name);
+                                                                let mut p = std::path::PathBuf::from(get_download_dir());
+                                                                let _ = std::fs::create_dir_all(&p);
+                                                                p.push(&safe_name);
                                                                 
-                                                                if let Ok(f) = fs::File::create(&path).await {
+                                                                if let Ok(f) = fs::File::create(&p).await {
                                                                     *file_mtx.lock().await = Some(f);
                                                                     *name_mtx.lock().await = safe_name;
                                                                 }

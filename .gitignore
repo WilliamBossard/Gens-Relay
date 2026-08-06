@@ -22,3 +22,8 @@ node_modules/
 *.swo
 .DS_Store
 Thumbs.db
+
+# Tauri & Frontend Web
+dist/
+gens-gui/dist/
+gens-gui/src-tauri/gen/

@@ -1,6 +1,6 @@
 [workspace]
 members = [
     "gens-daemon",
-    "gens-gui"
+    "gens-gui/src-tauri"
 ]
 resolver = "2"
