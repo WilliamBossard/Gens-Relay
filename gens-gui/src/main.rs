@@ -1,16 +1,18 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use chrono::{DateTime, Local};
 use eframe::egui;
+use egui_extras::{Column, TableBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 #[derive(Serialize)]
 struct IpcCommand {
@@ -90,8 +92,8 @@ fn write_env(domain: &str, token: &str) {
 fn main() {
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1000.0, 700.0])
-            .with_title("Gens-Relay P2P"),
+            .with_inner_size([1200.0, 750.0])
+            .with_title("Gens-Relay P2P Pro"),
         ..Default::default()
     };
     
@@ -104,37 +106,7 @@ fn main() {
     );
 
     if let Err(e) = result {
-        eprintln!("============================================================");
-        eprintln!("Fatal error launching Gens-Relay GUI.");
-        eprintln!("Details: {}", e);
-        eprintln!("------------------------------------------------------------");
-        eprintln!("If you are in a Virtual Machine (VM) and see");
-        eprintln!("'NoSuitableAdapterFound', your VM has no hardware GPU.");
-        eprintln!("");
-        eprintln!("Recommended solutions:");
-        eprintln!("  1. Run on host.");
-        eprintln!("  2. Install Mesa3D (llvmpipe) for software CPU rendering.");
-        eprintln!("============================================================");
-        
-        #[cfg(windows)]
-        {
-            let msg = format!("GPU Error: {}\n\nIf you are on a VM, install Mesa3D (llvmpipe).", e);
-            use std::ffi::OsStr;
-            use std::iter::once;
-            use std::os::windows::ffi::OsStrExt;
-            
-            let wide: Vec<u16> = OsStr::new(&msg).encode_wide().chain(once(0)).collect();
-            let wide_title: Vec<u16> = OsStr::new("Gens-Relay Fatal Error").encode_wide().chain(once(0)).collect();
-            
-            #[link(name = "user32")]
-            unsafe extern "system" {
-                fn MessageBoxW(hwnd: *mut std::ffi::c_void, lptext: *const u16, lpcaption: *const u16, utype: u32) -> i32;
-            }
-            
-            unsafe {
-                MessageBoxW(std::ptr::null_mut(), wide.as_ptr(), wide_title.as_ptr(), 0x10);
-            }
-        }
+        eprintln!("Fatal error launching Gens-Relay GUI: {}", e);
     }
 }
 
@@ -142,7 +114,14 @@ fn main() {
 enum Tab {
     Chat,
     Files,
-    RemoteFiles,
+    FileExplorer,
+}
+
+struct LocalFileEntry {
+    name: String,
+    is_dir: bool,
+    size: u64,
+    time: u64,
 }
 
 struct MyApp {
@@ -158,7 +137,7 @@ struct MyApp {
     my_hostname: Option<String>,
     daemon_process: Option<Child>,
     current_tab: Tab,
-    file_progress: Option<(String, usize, usize)>, // (filename, sent, total)
+    file_progress: Option<(String, usize, usize)>,
     pending_file: Option<std::path::PathBuf>,
     
     unpaired: bool,
@@ -170,9 +149,14 @@ struct MyApp {
     remote_parent_path: String,
     remote_entries: Vec<Value>,
     
+    local_current_path: std::path::PathBuf,
+    local_entries: Vec<LocalFileEntry>,
+    
     show_manual_peer_modal: bool,
     manual_peer_id: String,
     manual_peer_ip: String,
+    
+    e2ee_secured_peers: HashSet<String>,
 }
 
 impl MyApp {
@@ -202,7 +186,7 @@ impl MyApp {
 
         Self::start_tcp_thread(event_tx, cmd_rx, ctx_clone);
 
-        Self {
+        let mut app = Self {
             cmd_tx,
             event_rx,
             connected: false,
@@ -227,10 +211,38 @@ impl MyApp {
             remote_parent_path: String::new(),
             remote_entries: Vec::new(),
             
+            local_current_path: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            local_entries: Vec::new(),
+            
             show_manual_peer_modal: false,
             manual_peer_id: String::new(),
             manual_peer_ip: String::new(),
+            
+            e2ee_secured_peers: HashSet::new(),
+        };
+        app.refresh_local_files();
+        app
+    }
+    
+    fn refresh_local_files(&mut self) {
+        self.local_entries.clear();
+        if let Ok(mut dir) = fs::read_dir(&self.local_current_path) {
+            while let Some(Ok(entry)) = dir.next() {
+                if let Ok(metadata) = entry.metadata() {
+                    let time = metadata.modified().unwrap_or(std::time::SystemTime::now())
+                        .duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                    self.local_entries.push(LocalFileEntry {
+                        name: entry.file_name().to_string_lossy().to_string(),
+                        is_dir: metadata.is_dir(),
+                        size: metadata.len(),
+                        time,
+                    });
+                }
+            }
         }
+        self.local_entries.sort_by(|a, b| {
+            b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name))
+        });
     }
     
     fn start_tcp_thread(event_tx: Sender<String>, cmd_rx: Receiver<String>, ctx_clone: egui::Context) {
@@ -291,6 +303,25 @@ impl MyApp {
         }
         self.daemon_process = spawn_daemon();
     }
+    
+    fn format_size(size: u64) -> String {
+        if size == 0 { return String::new(); }
+        let kb = size / 1024;
+        if kb < 1024 {
+            format!("{} KB", kb)
+        } else {
+            format!("{:.2} MB", kb as f64 / 1024.0)
+        }
+    }
+    
+    fn format_date(ts: u64) -> String {
+        if let Some(dt) = chrono::DateTime::from_timestamp(ts as i64, 0) {
+            let local: DateTime<Local> = DateTime::from(dt);
+            local.format("%Y-%m-%d %H:%M").to_string()
+        } else {
+            String::new()
+        }
+    }
 }
 
 impl Drop for MyApp {
@@ -328,6 +359,14 @@ impl eframe::App for MyApp {
                             }
                         }
                     }
+                    "e2ee_status" => {
+                        if let Some(target) = evt.data.get("target").and_then(|v| v.as_str()) {
+                            if evt.data.get("secured").and_then(|v| v.as_bool()).unwrap_or(false) {
+                                self.e2ee_secured_peers.insert(target.to_string());
+                                self.chat_messages.push(">>> 🔒 Tunnel securely established (Curve25519 + ChaCha20-Poly1305)".to_string());
+                            }
+                        }
+                    }
                     "pairing_discovered" => {
                         if let (Some(domain), Some(token)) = (evt.data.get("domain").and_then(|v| v.as_str()), evt.data.get("token").and_then(|v| v.as_str())) {
                             self.discovered_pairing = Some((domain.to_string(), token.to_string()));
@@ -348,10 +387,16 @@ impl eframe::App for MyApp {
                         let filename = evt.data.get("filename").and_then(|v| v.as_str()).unwrap_or("").to_string();
                         let sent = evt.data.get("bytes_sent").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                         let total = evt.data.get("total").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
-                        self.file_progress = Some((filename, sent, total));
+                        self.file_progress = Some((filename.clone(), sent, total));
                         if sent >= total {
                             self.file_progress = None;
-                            self.chat_messages.push(">>> File transfer complete.".to_string());
+                            self.chat_messages.push(format!(">>> File transfer complete: {}", filename));
+                            if self.current_tab == Tab::FileExplorer {
+                                self.refresh_local_files();
+                                if let Some(t) = &self.selected_target {
+                                    self.send_command(IpcCommand { action: "ls".into(), target: Some(t.clone()), msg: None, path: Some(self.remote_current_path.clone()) });
+                                }
+                            }
                         }
                     }
                     "ls_result" => {
@@ -378,7 +423,7 @@ impl eframe::App for MyApp {
         }
 
         if self.unpaired {
-            egui::CentralPanel::default().show(ctx, |ui| {
+            egui::CentralPanel::default().frame(egui::Frame::default().fill(egui::Color32::from_rgb(30, 30, 30)).inner_margin(20.0)).show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.add_space(50.0);
                     ui.heading(egui::RichText::new("Gens-Relay").strong().size(30.0));
@@ -545,12 +590,12 @@ impl eframe::App for MyApp {
             }
         });
 
-        egui::CentralPanel::default().frame(egui::Frame::default().fill(egui::Color32::from_rgb(51, 51, 51)).inner_margin(20.0)).show(ctx, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::default().fill(egui::Color32::from_rgb(30, 30, 30)).inner_margin(20.0)).show(ctx, |ui| {
             if let Some(target) = self.selected_target.clone() {
                 let display_name = self.prefs.aliases.get(&target).cloned().unwrap_or_else(|| target.clone());
                 
                 ui.horizontal(|ui| {
-                    ui.heading(format!("Chat with {}", display_name));
+                    ui.heading(format!("Peer: {}", display_name));
                     
                     let mut alias = display_name.clone();
                     if ui.add(egui::TextEdit::singleline(&mut alias).desired_width(100.0)).changed() {
@@ -562,17 +607,29 @@ impl eframe::App for MyApp {
                         self.send_command(IpcCommand { action: "connect".into(), target: Some(target.clone()), msg: None, path: None });
                         self.chat_messages.push(format!(">>> WebRTC Connection Initiated..."));
                     }
+                    
+                    if self.e2ee_secured_peers.contains(&target) {
+                        ui.add_space(20.0);
+                        ui.label(egui::RichText::new("🔒 E2EE Secured").color(egui::Color32::GREEN).strong());
+                    }
                 });
                 ui.add_space(10.0);
 
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.current_tab, Tab::Chat, "P2P Chat");
-                    ui.selectable_value(&mut self.current_tab, Tab::Files, "Local Files (Drag/Drop)");
-                    if ui.selectable_value(&mut self.current_tab, Tab::RemoteFiles, "Remote File Explorer").clicked() {
+                    ui.selectable_value(&mut self.current_tab, Tab::Files, "File Dropzone");
+                    if ui.selectable_value(&mut self.current_tab, Tab::FileExplorer, "File Explorer (Split-View)").clicked() {
                         self.send_command(IpcCommand { action: "ls".into(), target: Some(target.clone()), msg: None, path: Some("".into()) });
                     }
                 });
                 ui.separator();
+                
+                if let Some((name, sent, total)) = &self.file_progress {
+                    ui.label(format!("Transferring: {}", name));
+                    let progress = if *total > 0 { *sent as f32 / *total as f32 } else { 0.0 };
+                    ui.add(egui::ProgressBar::new(progress).show_percentage());
+                    ui.add_space(10.0);
+                }
 
                 match self.current_tab {
                     Tab::Chat => {
@@ -650,57 +707,175 @@ impl eframe::App for MyApp {
                                 });
                             });
                         }
-
-                        if let Some((name, sent, total)) = &self.file_progress {
-                            ui.add_space(20.0);
-                            ui.label(format!("Sending: {}", name));
-                            let progress = if *total > 0 { *sent as f32 / *total as f32 } else { 0.0 };
-                            ui.add(egui::ProgressBar::new(progress).show_percentage());
-                        }
                     }
-                    Tab::RemoteFiles => {
-                        ui.horizontal(|ui| {
-                            ui.label("Path:");
-                            ui.label(egui::RichText::new(&self.remote_current_path).strong());
-                            if ui.button("Refresh").clicked() {
-                                self.send_command(IpcCommand { action: "ls".into(), target: Some(target.clone()), msg: None, path: Some(self.remote_current_path.clone()) });
-                            }
-                        });
-                        
-                        ui.add_space(10.0);
-                        
-                        egui::ScrollArea::vertical().show(ui, |ui| {
-                            if !self.remote_parent_path.is_empty() {
-                                if ui.button("⬆ .. (Up)").clicked() {
-                                    self.send_command(IpcCommand { action: "ls".into(), target: Some(target.clone()), msg: None, path: Some(self.remote_parent_path.clone()) });
-                                }
-                            }
-                            
-                            let entries = self.remote_entries.clone();
-                            for entry in &entries {
-                                let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                                let is_dir = entry.get("is_dir").and_then(|v| v.as_bool()).unwrap_or(false);
-                                let size = entry.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
-                                
+                    Tab::FileExplorer => {
+                        ui.columns(2, |columns| {
+                            // Left Panel: Local Files
+                            columns[0].vertical(|ui| {
+                                ui.heading("Local PC");
                                 ui.horizontal(|ui| {
-                                    if is_dir {
-                                        if ui.add(egui::Label::new(format!("📁 {}", name)).sense(egui::Sense::click())).double_clicked() {
-                                            let mut new_path = std::path::PathBuf::from(&self.remote_current_path);
-                                            new_path.push(name);
-                                            self.send_command(IpcCommand { action: "ls".into(), target: Some(target.clone()), msg: None, path: Some(new_path.to_string_lossy().to_string()) });
-                                        }
-                                    } else {
-                                        ui.label(format!("📄 {} ({} bytes)", name, size));
-                                        if ui.button("Download").clicked() {
-                                            let mut file_path = std::path::PathBuf::from(&self.remote_current_path);
-                                            file_path.push(name);
-                                            self.send_command(IpcCommand { action: "download_req".into(), target: Some(target.clone()), msg: None, path: Some(file_path.to_string_lossy().to_string()) });
-                                            self.chat_messages.push(format!(">>> Requesting download for {}", name));
-                                            self.current_tab = Tab::Chat;
-                                        }
+                                    ui.label(egui::RichText::new(self.local_current_path.to_string_lossy()).strong());
+                                    if ui.button("Refresh").clicked() {
+                                        self.refresh_local_files();
                                     }
                                 });
-                            }
+                                ui.add_space(5.0);
+                                
+                                let table = TableBuilder::new(ui)
+                                    .striped(true)
+                                    .resizable(true)
+                                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                                    .column(Column::auto().at_least(150.0))
+                                    .column(Column::auto())
+                                    .column(Column::remainder())
+                                    .min_scrolled_height(0.0);
+                                    
+                                table.header(20.0, |mut header| {
+                                    header.col(|ui| { ui.strong("Name"); });
+                                    header.col(|ui| { ui.strong("Size"); });
+                                    header.col(|ui| { ui.strong("Date"); });
+                                }).body(|mut body| {
+                                    let parent = self.local_current_path.parent().map(|p| p.to_path_buf());
+                                    if let Some(p) = parent {
+                                        body.row(20.0, |mut row| {
+                                            row.col(|ui| {
+                                                if ui.button("⬆ ..").clicked() {
+                                                    self.local_current_path = p;
+                                                    self.refresh_local_files();
+                                                }
+                                            });
+                                            row.col(|_| {}); row.col(|_| {});
+                                        });
+                                    }
+                                    
+                                    let entries = self.local_entries.iter().map(|e| (e.name.clone(), e.is_dir, e.size, e.time)).collect::<Vec<_>>();
+                                    for entry in entries {
+                                        let name = entry.0;
+                                        let is_dir = entry.1;
+                                        let size = entry.2;
+                                        let time = entry.3;
+                                        body.row(20.0, |mut row| {
+                                            row.col(|ui| {
+                                                let icon = if is_dir { "📁" } else { "📄" };
+                                                let label = ui.selectable_label(false, format!("{} {}", icon, name));
+                                                
+                                                if label.double_clicked() && is_dir {
+                                                    self.local_current_path.push(&name);
+                                                    self.refresh_local_files();
+                                                }
+                                                
+                                                if !is_dir && label.drag_started() {
+                                                    let mut file_path = self.local_current_path.clone();
+                                                    file_path.push(&name);
+                                                    ctx.memory_mut(|m| {
+                                                        m.data.insert_temp(egui::Id::new("drag_payload"), file_path.to_string_lossy().to_string());
+                                                    });
+                                                }
+                                            });
+                                            row.col(|ui| { if !is_dir { ui.label(Self::format_size(size)); } });
+                                            row.col(|ui| { ui.label(Self::format_date(time)); });
+                                        });
+                                    }
+                                });
+                                
+                                let rect = ui.available_rect_before_wrap();
+                                let resp = ui.interact(rect, ui.id().with("local_drop"), egui::Sense::hover());
+                                if resp.hovered() && ctx.dragged_id().is_some() {
+                                    ui.painter().rect_filled(rect, 4.0, egui::Color32::from_rgba_unmultiplied(100, 255, 100, 30));
+                                    if ctx.input(|i| i.pointer.any_released()) {
+                                        if let Some(payload) = ctx.memory(|m| m.data.get_temp::<String>(egui::Id::new("drag_remote_payload"))) {
+                                            let mut file_path = std::path::PathBuf::from(&self.remote_current_path);
+                                            file_path.push(payload.clone());
+                                            self.send_command(IpcCommand { action: "download_req".into(), target: Some(target.clone()), msg: None, path: Some(file_path.to_string_lossy().to_string()) });
+                                            self.chat_messages.push(format!(">>> Requesting secure download for {}", payload));
+                                        }
+                                    }
+                                }
+                            });
+                            
+                            // Right Panel: Remote Files
+                            columns[1].vertical(|ui| {
+                                ui.heading("Remote PC");
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(&self.remote_current_path).strong());
+                                    if ui.button("Refresh").clicked() {
+                                        self.send_command(IpcCommand { action: "ls".into(), target: Some(target.clone()), msg: None, path: Some(self.remote_current_path.clone()) });
+                                    }
+                                });
+                                ui.add_space(5.0);
+                                
+                                let table = TableBuilder::new(ui)
+                                    .striped(true)
+                                    .resizable(true)
+                                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                                    .column(Column::auto().at_least(150.0))
+                                    .column(Column::auto())
+                                    .column(Column::remainder())
+                                    .min_scrolled_height(0.0);
+                                    
+                                table.header(20.0, |mut header| {
+                                    header.col(|ui| { ui.strong("Name"); });
+                                    header.col(|ui| { ui.strong("Size"); });
+                                    header.col(|ui| { ui.strong("Date"); });
+                                }).body(|mut body| {
+                                    if !self.remote_parent_path.is_empty() {
+                                        body.row(20.0, |mut row| {
+                                            row.col(|ui| {
+                                                if ui.button("⬆ ..").clicked() {
+                                                    self.send_command(IpcCommand { action: "ls".into(), target: Some(target.clone()), msg: None, path: Some(self.remote_parent_path.clone()) });
+                                                }
+                                            });
+                                            row.col(|_| {}); row.col(|_| {});
+                                        });
+                                    }
+                                    
+                                    let entries = self.remote_entries.clone();
+                                    for entry in &entries {
+                                        let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                        let is_dir = entry.get("is_dir").and_then(|v| v.as_bool()).unwrap_or(false);
+                                        let size = entry.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+                                        let time = entry.get("time").and_then(|v| v.as_u64()).unwrap_or(0);
+                                        
+                                        body.row(20.0, |mut row| {
+                                            row.col(|ui| {
+                                                let icon = if is_dir { "📁" } else { "📄" };
+                                                let label = ui.selectable_label(false, format!("{} {}", icon, name));
+                                                
+                                                if label.double_clicked() && is_dir {
+                                                    let mut new_path = std::path::PathBuf::from(&self.remote_current_path);
+                                                    new_path.push(name);
+                                                    self.send_command(IpcCommand { action: "ls".into(), target: Some(target.clone()), msg: None, path: Some(new_path.to_string_lossy().to_string()) });
+                                                }
+                                                
+                                                if !is_dir && label.drag_started() {
+                                                    ctx.memory_mut(|m| {
+                                                        m.data.insert_temp(egui::Id::new("drag_remote_payload"), name.to_string());
+                                                    });
+                                                }
+                                            });
+                                            row.col(|ui| { if !is_dir { ui.label(Self::format_size(size)); } });
+                                            row.col(|ui| { ui.label(Self::format_date(time)); });
+                                        });
+                                    }
+                                });
+                                
+                                let rect = ui.available_rect_before_wrap();
+                                let resp = ui.interact(rect, ui.id().with("remote_drop"), egui::Sense::hover());
+                                if resp.hovered() && ctx.dragged_id().is_some() {
+                                    ui.painter().rect_filled(rect, 4.0, egui::Color32::from_rgba_unmultiplied(100, 100, 255, 30));
+                                    if ctx.input(|i| i.pointer.any_released()) {
+                                        if let Some(payload) = ctx.memory(|m| m.data.get_temp::<String>(egui::Id::new("drag_payload"))) {
+                                            self.send_command(IpcCommand {
+                                                action: "sendfile".into(),
+                                                target: Some(target.clone()),
+                                                msg: None,
+                                                path: Some(payload.clone()),
+                                            });
+                                            self.chat_messages.push(format!(">>> Started secure upload of {:?}", payload));
+                                        }
+                                    }
+                                }
+                            });
                         });
                     }
                 }
