@@ -1,0 +1,8 @@
+[package]
+name = "gens-gui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = { version = "0.29", features = ["wgpu", "wayland", "x11"] }
+egui = "0.29"

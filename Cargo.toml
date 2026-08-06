@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "gens-daemon",
+    "gens-gui"
+]
+resolver = "2"

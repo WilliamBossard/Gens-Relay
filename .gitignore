@@ -1,0 +1,21 @@
+# Rust / Cargo
+target/
+target_run*/
+**/*.rs.bk
+
+# Environnement / Secrets
+.env
+.env.*
+
+# Données d'application
+/downloads/
+/gens-daemon/downloads/
+
+# IDE et OS
+node_modules/
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

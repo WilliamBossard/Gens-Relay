@@ -1,0 +1,16 @@
+[package]
+name = "gens-daemon"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dotenvy = "0.15"
+futures-util = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.37", features = ["full"] }
+tokio-tungstenite = "0.21"
+url = "2.5"
+webrtc = "0.11.0"
+hostname = "0.4"
+bytes = "1.0"
