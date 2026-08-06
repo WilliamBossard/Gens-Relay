@@ -1,14 +1,13 @@
-
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UdpSocket, TcpListener};
-use tokio::sync::{mpsc, Mutex, broadcast};
+use tokio::net::{TcpListener, UdpSocket};
+use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use url::Url;
 
@@ -27,17 +26,14 @@ use webrtc::peer_connection::RTCPeerConnection;
 enum ServerMessage {
     #[serde(rename = "welcome")]
     Welcome { id: String },
-
     #[serde(rename = "peer-message")]
     PeerMessage {
         #[serde(rename = "senderId")]
         sender_id: String,
         payload: serde_json::Value,
     },
-
     #[serde(rename = "error")]
     Error { message: String },
-
     #[serde(other)]
     Unknown,
 }
@@ -55,13 +51,10 @@ struct ClientAction {
 enum SignalingPayload {
     #[serde(rename = "offer")]
     Offer { sdp: RTCSessionDescription, hostname: String },
-
     #[serde(rename = "answer")]
     Answer { sdp: RTCSessionDescription, hostname: String },
-
     #[serde(rename = "ice_candidate")]
     IceCandidate { candidate: RTCIceCandidateInit },
-
     #[serde(rename = "chat")]
     Chat { message: String },
 }
@@ -70,6 +63,15 @@ enum SignalingPayload {
 struct DiscoveryPacket {
     id: String,
     hostname: String,
+    token: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct PairingOfferPacket {
+    #[serde(rename = "type")]
+    packet_type: String,
+    domain: String,
+    token: String,
 }
 
 #[derive(Clone, Debug)]
@@ -77,7 +79,6 @@ struct PeerInfo {
     id: String,
     ip: String,
 }
-
 
 #[derive(Serialize)]
 struct IpcEvent {
@@ -143,39 +144,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             hostname::get().unwrap_or_else(|_| "Unknown".into()).to_string_lossy().to_string()
         });
 
-    let relay_domain = env::var("RELAY_DOMAIN").unwrap_or_else(|_| {
-        eprintln!("Erreur : RELAY_DOMAIN non défini.");
-        std::process::exit(1);
-    });
+    let relay_domain_opt = env::var("RELAY_DOMAIN").ok();
+    let auth_token_opt = env::var("AUTH_TOKEN").ok();
+    
+    let is_paired = relay_domain_opt.is_some() && auth_token_opt.is_some();
 
-    let auth_token = env::var("AUTH_TOKEN").unwrap_or_else(|_| {
-        eprintln!("Erreur : AUTH_TOKEN non défini.");
-        std::process::exit(1);
-    });
-
-    let _ = fs::create_dir_all("downloads").await;
-
-    let mut url = match Url::parse(&relay_domain) {
-        Ok(u) => u,
-        Err(e) => {
-            eprintln!("Erreur : RELAY_DOMAIN invalide : {}", e);
-            std::process::exit(1);
-        }
-    };
-    url.query_pairs_mut().append_pair("token", &auth_token);
-
-    println!(">>> Démarrage du Daemon [{}] <<<", my_hostname);
-    println!("Tentative de connexion à {}...", relay_domain);
-
-    let (ws_stream, _) = match connect_async(url.as_str()).await {
-        Ok(res) => res,
-        Err(e) => {
-            eprintln!("Erreur fatale : Impossible de se connecter : {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    let (mut write, mut read) = ws_stream.split();
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<ClientAction>(100);
     let (ipc_tx, _ipc_rx) = broadcast::channel::<String>(100);
 
@@ -189,93 +162,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         local_id: Arc::new(Mutex::new(None)),
     };
 
-    let local_peers_clone = state.local_peers.clone();
-    let ipc_tx_udp = state.ipc_tx.clone();
-    let my_host_clone = my_hostname.clone();
-    tokio::spawn(async move {
-        if let Ok(socket) = UdpSocket::bind("0.0.0.0:8888").await {
-            let mut buf = [0; 1024];
-            loop {
-                if let Ok((len, addr)) = socket.recv_from(&mut buf).await {
-                    if let Ok(text) = std::str::from_utf8(&buf[..len]) {
-                        if let Ok(discovery) = serde_json::from_str::<DiscoveryPacket>(text) {
-                            if discovery.hostname != my_host_clone {
-                                let mut peers = local_peers_clone.lock().await;
-                                let mut is_new = false;
-                                if !peers.contains_key(&discovery.hostname) {
-                                    println!("[UDP] Nouveau pair découvert : {} (ID: {}, IP: {})", discovery.hostname, discovery.id, addr.ip());
-                                    is_new = true;
-                                }
-                                peers.insert(discovery.hostname.clone(), PeerInfo {
-                                    id: discovery.id.clone(),
-                                    ip: addr.ip().to_string(),
-                                });
-                                if is_new {
-                                    let mut peer_list = Vec::new();
-                                    for (host, info) in peers.iter() {
-                                        peer_list.push(serde_json::json!({"hostname": host, "id": &info.id, "ip": &info.ip}));
-                                    }
-                                    let event = IpcEvent {
-                                        event: "peers_updated".to_string(),
-                                        data: serde_json::json!({"peers": peer_list}),
-                                    };
-                                    let _ = ipc_tx_udp.send(serde_json::to_string(&event).unwrap());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    });
-
     let (command_tx, mut command_rx) = mpsc::channel::<IpcCommand>(32);
-    let state_console = state.clone();
-    
-    let command_tx_console = command_tx.clone();
-    tokio::spawn(async move {
-        let stdin = tokio::io::stdin();
-        let mut reader = BufReader::new(stdin).lines();
-        println!(">>> Commandes :");
-        println!(">>>   list                        (Voir l'annuaire local)");
-        println!(">>>   connect <TARGET_ID/NOM>     (Initier tunnel WebRTC)");
-        println!(">>>   p2p <TARGET_ID/NOM> <MSG>   (Envoyer texte via tunnel)");
-        println!(">>>   sendfile <TARGET_ID/NOM> <PATH>");
-        
-        while let Ok(Some(line)) = reader.next_line().await {
-            let parts: Vec<&str> = line.trim().splitn(3, ' ').collect();
-            if parts.is_empty() { continue; }
-            let action = parts[0];
-            let cmd = match action {
-                "list" | "peers" => IpcCommand { action: "list".into(), target: None, msg: None, path: None },
-                "connect" if parts.len() >= 2 => IpcCommand { action: "connect".into(), target: Some(parts[1].into()), msg: None, path: None },
-                "p2p" if parts.len() >= 3 => IpcCommand { action: "p2p".into(), target: Some(parts[1].into()), msg: Some(parts[2].into()), path: None },
-                "sendfile" if parts.len() >= 3 => IpcCommand { action: "sendfile".into(), target: Some(parts[1].into()), path: Some(parts[2].into()), msg: None },
-                _ => { println!(">>> Commande inconnue ou format invalide."); continue; }
-            };
-            if command_tx_console.send(cmd).await.is_err() { break; }
-        }
-    });
-
-    let command_tx_ipc = command_tx.clone();
     let ipc_tx_tcp = state.ipc_tx.clone();
     let state_for_ipc = state.clone();
+    let is_paired_for_ipc = is_paired;
+    
     tokio::spawn(async move {
         if let Ok(listener) = TcpListener::bind("127.0.0.1:0").await {
             let local_addr = listener.local_addr().unwrap();
             let port = local_addr.port();
-            println!(">>> Serveur IPC en écoute sur 127.0.0.1:{} <<<", port);
+            println!("[IPC] Server listening on 127.0.0.1:{}", port);
             
             let ipc_file = get_ipc_file_path();
             if let Err(e) = fs::write(&ipc_file, port.to_string()).await {
-                eprintln!("Erreur lors de l'écriture du fichier .ipc_port : {}", e);
+                eprintln!("[IPC] Error writing .ipc_port file: {}", e);
             }
             
             while let Ok((mut socket, _)) = listener.accept().await {
-                let command_tx = command_tx_ipc.clone();
+                let command_tx = command_tx.clone();
                 let mut rx = ipc_tx_tcp.subscribe();
                 
-                if let Some(id) = state_for_ipc.local_id.lock().await.clone() {
+                if !is_paired_for_ipc {
+                    let status_event = IpcEvent {
+                        event: "status".to_string(),
+                        data: serde_json::json!({"unpaired": true}),
+                    };
+                    let _ = state_for_ipc.ipc_tx.send(serde_json::to_string(&status_event).unwrap());
+                } else if let Some(id) = state_for_ipc.local_id.lock().await.clone() {
                     let status_event = IpcEvent {
                         event: "status".to_string(),
                         data: serde_json::json!({"id": id, "hostname": state_for_ipc.hostname.clone()}),
@@ -307,11 +220,112 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
             }
         } else {
-            eprintln!("Erreur: Impossible de démarrer le serveur IPC");
+            eprintln!("[IPC] Error: Could not start IPC server.");
         }
     });
 
+    if !is_paired {
+        println!("[Daemon] Running in Unpaired Mode.");
+        let ipc_tx_udp = state.ipc_tx.clone();
+        tokio::spawn(async move {
+            if let Ok(socket) = UdpSocket::bind("0.0.0.0:8888").await {
+                let mut buf = [0; 1024];
+                loop {
+                    if let Ok((len, _addr)) = socket.recv_from(&mut buf).await {
+                        if let Ok(text) = std::str::from_utf8(&buf[..len]) {
+                            if let Ok(packet) = serde_json::from_str::<PairingOfferPacket>(text) {
+                                if packet.packet_type == "pairing_offer" {
+                                    println!("[UDP] Discovered pairing offer from {}", packet.domain);
+                                    let event = IpcEvent {
+                                        event: "pairing_discovered".to_string(),
+                                        data: serde_json::json!({"domain": packet.domain, "token": packet.token}),
+                                    };
+                                    let _ = ipc_tx_udp.send(serde_json::to_string(&event).unwrap());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
+        }
+    }
+
+    let relay_domain = relay_domain_opt.unwrap();
+    let auth_token = auth_token_opt.unwrap();
+
+    let mut url = match Url::parse(&relay_domain) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("[Daemon] Error: Invalid RELAY_DOMAIN : {}", e);
+            std::process::exit(1);
+        }
+    };
+    url.query_pairs_mut().append_pair("token", &auth_token);
+
+    println!("[Daemon] Starting Daemon [{}]", my_hostname);
+    println!("[Daemon] Connecting to {}...", relay_domain);
+
+    let (ws_stream, _) = match connect_async(url.as_str()).await {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!("[Daemon] Fatal error: Could not connect to signaling server : {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let (mut write, mut read) = ws_stream.split();
     let api = APIBuilder::new().build();
+    let state_console = state.clone();
+
+    let local_peers_clone = state.local_peers.clone();
+    let ipc_tx_udp = state.ipc_tx.clone();
+    let my_host_clone = my_hostname.clone();
+    let auth_token_udp = auth_token.clone();
+    tokio::spawn(async move {
+        let broadcast_addr = env::var("BROADCAST_ADDR").unwrap_or_else(|_| "255.255.255.255:8888".to_string());
+        if !broadcast_addr.contains(':') {
+            eprintln!("[UDP] BROADCAST_ADDR must include port (e.g. 192.168.1.255:8888).");
+        }
+        
+        if let Ok(socket) = UdpSocket::bind("0.0.0.0:8888").await {
+            let mut buf = [0; 1024];
+            loop {
+                if let Ok((len, addr)) = socket.recv_from(&mut buf).await {
+                    if let Ok(text) = std::str::from_utf8(&buf[..len]) {
+                        if let Ok(discovery) = serde_json::from_str::<DiscoveryPacket>(text) {
+                            if discovery.token == auth_token_udp && discovery.hostname != my_host_clone {
+                                let mut peers = local_peers_clone.lock().await;
+                                let mut is_new = false;
+                                if !peers.contains_key(&discovery.hostname) {
+                                    println!("[UDP] New peer discovered: {} (ID: {}, IP: {})", discovery.hostname, discovery.id, addr.ip());
+                                    is_new = true;
+                                }
+                                peers.insert(discovery.hostname.clone(), PeerInfo {
+                                    id: discovery.id.clone(),
+                                    ip: addr.ip().to_string(),
+                                });
+                                if is_new {
+                                    let mut peer_list = Vec::new();
+                                    for (host, info) in peers.iter() {
+                                        peer_list.push(serde_json::json!({"hostname": host, "id": &info.id, "ip": &info.ip}));
+                                    }
+                                    let event = IpcEvent {
+                                        event: "peers_updated".to_string(),
+                                        data: serde_json::json!({"peers": peer_list}),
+                                    };
+                                    let _ = ipc_tx_udp.send(serde_json::to_string(&event).unwrap());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
 
     loop {
         tokio::select! {
@@ -322,7 +336,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Ok(server_msg) = serde_json::from_str::<ServerMessage>(&text) {
                                 match server_msg {
                                     ServerMessage::Welcome { id } => {
-                                        println!("[Succès] Connecté au réseau ! Mon ID est : {}.", id);
+                                        println!("[Success] Connected to network! My ID is: {}.", id);
                                         *state.local_id.lock().await = Some(id.clone());
                                         let status_event = IpcEvent {
                                             event: "status".to_string(),
@@ -332,12 +346,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         
                                         let udp_id = id.clone();
                                         let udp_host = state.hostname.clone();
+                                        let udp_token = auth_token.clone();
+                                        
                                         tokio::spawn(async move {
+                                            let broadcast_addr = env::var("BROADCAST_ADDR").unwrap_or_else(|_| "255.255.255.255:8888".to_string());
                                             if let Ok(socket) = UdpSocket::bind("0.0.0.0:0").await {
                                                 if socket.set_broadcast(true).is_ok() {
-                                                    let packet = serde_json::to_string(&DiscoveryPacket { id: udp_id, hostname: udp_host }).unwrap();
+                                                    let packet = serde_json::to_string(&DiscoveryPacket { 
+                                                        id: udp_id, 
+                                                        hostname: udp_host,
+                                                        token: udp_token 
+                                                    }).unwrap();
                                                     loop {
-                                                        let _ = socket.send_to(packet.as_bytes(), "255.255.255.255:8888").await;
+                                                        let _ = socket.send_to(packet.as_bytes(), &broadcast_addr).await;
                                                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                                                     }
                                                 }
@@ -350,7 +371,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             match sig_payload {
                                                 SignalingPayload::Chat { message: _message } => {}
                                                 SignalingPayload::Offer { sdp, hostname } => {
-                                                    println!("[WebRTC] Offre P2P reçue de {} ({})", hostname, sender_id);
+                                                    println!("[WebRTC] P2P Offer received from {} ({})", hostname, sender_id);
                                                     let pc = create_peer_connection(&api, target_id.clone(), state.clone()).await?;
                                                     pc.set_remote_description(sdp).await?;
                                                     
@@ -366,7 +387,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     state.peers.lock().await.insert(target_id, pc);
                                                 }
                                                 SignalingPayload::Answer { sdp, hostname } => {
-                                                    println!("[WebRTC] Réponse P2P reçue de {} ({})", hostname, sender_id);
+                                                    println!("[WebRTC] P2P Answer received from {} ({})", hostname, sender_id);
                                                     if let Some(pc) = state.peers.lock().await.get(&sender_id) {
                                                         let _ = pc.set_remote_description(sdp).await;
                                                     }
@@ -379,19 +400,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             }
                                         }
                                     }
-                                    ServerMessage::Error { message } => eprintln!("[Erreur Serveur] {}", message),
+                                    ServerMessage::Error { message } => eprintln!("[Server Error] {}", message),
                                     ServerMessage::Unknown => {}
                                 }
                             }
                         }
                     }
                     Err(e) => {
-                        eprintln!("[Erreur] Connexion interrompue : {}", e);
+                        eprintln!("[Error] Connection interrupted: {}", e);
                         break;
                     }
                 }
             }
-
+            
             Some(cmd) = command_rx.recv() => {
                 match cmd.action.as_str() {
                     "list" => {
@@ -399,7 +420,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let mut peer_list = Vec::new();
                         for (host, info) in peers.iter() {
                             peer_list.push(serde_json::json!({"hostname": host, "id": &info.id, "ip": &info.ip}));
-                            println!("  - {} -> ID: {} (IP: {})", host, info.id, info.ip);
                         }
                         let event = IpcEvent {
                             event: "peers_updated".to_string(),
@@ -407,13 +427,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         };
                         let _ = state.ipc_tx.send(serde_json::to_string(&event).unwrap());
                     }
-                    action @ "connect" | action @ "p2p" | action @ "sendfile" => {
+                    action @ "connect" | action @ "p2p" | action @ "sendfile" | action @ "ls" | action @ "download_req" => {
                         if let Some(raw_target) = cmd.target {
                             let target_id = resolve_target(&raw_target, &state_console).await;
                             
                             match action {
                                 "connect" => {
-                                    println!("[WebRTC] Initiation de la connexion vers {} (ID: {})...", raw_target, target_id);
+                                    println!("[WebRTC] Initiating connection to {} (ID: {})...", raw_target, target_id);
                                     let pc = create_peer_connection(&api, target_id.clone(), state.clone()).await?;
                                     let data_channel = pc.create_data_channel("data", None).await?;
                                     setup_data_channel(&data_channel, target_id.clone(), state.clone()).await;
@@ -436,7 +456,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         if let Some(dc) = state.data_channels.lock().await.get(&target_id) {
                                             let _ = dc.send_text(msg).await;
                                         } else {
-                                            println!("[Erreur] Aucun tunnel P2P ouvert avec {}.", target_id);
+                                            println!("[Error] No P2P tunnel open with {}.", target_id);
+                                        }
+                                    }
+                                }
+                                "ls" => {
+                                    if let Some(path) = cmd.path {
+                                        if let Some(dc) = state.data_channels.lock().await.get(&target_id) {
+                                            let req = serde_json::json!({"type": "ls", "path": path});
+                                            let _ = dc.send_text(req.to_string()).await;
+                                        }
+                                    }
+                                }
+                                "download_req" => {
+                                    if let Some(path) = cmd.path {
+                                        if let Some(dc) = state.data_channels.lock().await.get(&target_id) {
+                                            let req = serde_json::json!({"type": "download_req", "path": path});
+                                            let _ = dc.send_text(req.to_string()).await;
                                         }
                                     }
                                 }
@@ -450,7 +486,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     let meta = file.metadata().await.unwrap();
                                                     let file_name = Path::new(&path).file_name().unwrap().to_string_lossy().into_owned();
                                                     
-                                                    println!("[Fichier] Envoi de {} ({} octets) vers {}...", file_name, meta.len(), target_id);
+                                                    println!("[File] Sending {} ({} bytes) to {}...", file_name, meta.len(), target_id);
                                                     
                                                     let start_msg = serde_json::json!({
                                                         "type": "file_start",
@@ -483,13 +519,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                             let _ = ipc_tx_clone.send(serde_json::to_string(&progress).unwrap());
                                                         }
                                                     }
-                                                    println!("[Fichier] {} envoyé avec succès ({} octets) !", file_name, total);
+                                                    println!("[File] {} successfully sent ({} bytes)!", file_name, total);
                                                 } else {
-                                                    println!("[Erreur] Fichier introuvable : {}", path);
+                                                    println!("[Error] File not found: {}", path);
                                                 }
                                             });
                                         } else {
-                                            println!("[Erreur] Aucun tunnel P2P ouvert avec {}.", target_id);
+                                            println!("[Error] No P2P tunnel open with {}.", target_id);
                                         }
                                     }
                                 }
@@ -563,13 +599,14 @@ async fn create_peer_connection(api: &webrtc::api::API, target_id: String, state
 async fn setup_data_channel(data_channel: &Arc<RTCDataChannel>, target_id: String, _state: AppState) {
     let target_clone = target_id.clone();
     data_channel.on_open(Box::new(move || {
-        println!("[P2P] Tunnel ouvert avec {} !", target_clone);
+        println!("[P2P] Tunnel opened with {}!", target_clone);
         Box::pin(async {})
     }));
 
     let target_clone_msg = target_id.clone();
     let current_file: Arc<Mutex<Option<fs::File>>> = Arc::new(Mutex::new(None));
     let current_filename: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let dc_clone = data_channel.clone();
 
     let state_msg = _state.clone();
     data_channel.on_message(Box::new(move |msg: DataChannelMessage| {
@@ -577,23 +614,111 @@ async fn setup_data_channel(data_channel: &Arc<RTCDataChannel>, target_id: Strin
         let file_mtx = current_file.clone();
         let name_mtx = current_filename.clone();
         let state3 = state_msg.clone();
+        let dc = dc_clone.clone();
 
         Box::pin(async move {
             if msg.is_string {
                 if let Ok(text) = String::from_utf8(msg.data.to_vec()) {
                     let mut handled = false;
                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-                        if json.get("type").and_then(|t| t.as_str()) == Some("file_start") {
+                        let t = json.get("type").and_then(|v| v.as_str());
+                        if t == Some("file_start") {
                             handled = true;
                             if let Some(name) = json.get("name").and_then(|n| n.as_str()) {
-                                println!("[Fichier] Démarrage de la réception : {} depuis {}...", name, target2);
+                                println!("[File] Starting reception: {} from {}...", name, target2);
                                 let safe_name = name.replace("..", "").replace("/", "").replace("\\", "");
+                                let _ = fs::create_dir_all("downloads").await;
                                 let path = format!("downloads/{}", safe_name);
                                 
                                 if let Ok(f) = fs::File::create(&path).await {
                                     *file_mtx.lock().await = Some(f);
                                     *name_mtx.lock().await = safe_name;
                                 }
+                            }
+                        } else if t == Some("ls") {
+                            handled = true;
+                            if let Some(path_str) = json.get("path").and_then(|n| n.as_str()) {
+                                let mut entries = Vec::new();
+                                let target_path = if path_str.is_empty() {
+                                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+                                } else {
+                                    PathBuf::from(path_str)
+                                };
+                                
+                                if let Ok(mut dir) = fs::read_dir(&target_path).await {
+                                    while let Ok(Some(entry)) = dir.next_entry().await {
+                                        if let Ok(metadata) = entry.metadata().await {
+                                            entries.push(serde_json::json!({
+                                                "name": entry.file_name().to_string_lossy(),
+                                                "is_dir": metadata.is_dir(),
+                                                "size": metadata.len()
+                                            }));
+                                        }
+                                    }
+                                }
+                                
+                                let parent = target_path.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+                                let resp = serde_json::json!({
+                                    "type": "ls_result",
+                                    "path": target_path.to_string_lossy(),
+                                    "parent": parent,
+                                    "entries": entries
+                                });
+                                let _ = dc.send_text(resp.to_string()).await;
+                            }
+                        } else if t == Some("ls_result") {
+                            handled = true;
+                            let event = IpcEvent {
+                                event: "ls_result".to_string(),
+                                data: json.clone(),
+                            };
+                            let _ = state3.ipc_tx.send(serde_json::to_string(&event).unwrap());
+                        } else if t == Some("download_req") {
+                            handled = true;
+                            if let Some(path_str) = json.get("path").and_then(|n| n.as_str()) {
+                                let path = path_str.to_string();
+                                let target_id = target2.clone();
+                                let dc = dc.clone();
+                                let state_tx = state3.ipc_tx.clone();
+                                
+                                tokio::spawn(async move {
+                                    if let Ok(mut file) = fs::File::open(&path).await {
+                                        let meta = file.metadata().await.unwrap();
+                                        let file_name = Path::new(&path).file_name().unwrap().to_string_lossy().into_owned();
+                                        
+                                        let start_msg = serde_json::json!({
+                                            "type": "file_start",
+                                            "name": file_name,
+                                            "size": meta.len()
+                                        });
+                                        let _ = dc.send_text(start_msg.to_string()).await;
+                                        
+                                        let mut buf = vec![0u8; 16384];
+                                        let mut total = 0;
+                                        let mut last_progress_report = 0;
+                                        while let Ok(n) = file.read(&mut buf).await {
+                                            if n == 0 { break; }
+                                            let chunk = bytes::Bytes::copy_from_slice(&buf[..n]);
+                                            let _ = dc.send(&chunk).await;
+                                            total += n;
+                                            
+                                            if total - last_progress_report > 512 * 1024 || total == (meta.len() as usize) {
+                                                last_progress_report = total;
+                                                let progress = IpcEvent {
+                                                    event: "file_progress".to_string(),
+                                                    data: serde_json::json!({
+                                                        "filename": file_name,
+                                                        "bytes_sent": total,
+                                                        "total": meta.len(),
+                                                        "target": target_id,
+                                                        "direction": "send"
+                                                    })
+                                                };
+                                                let _ = state_tx.send(serde_json::to_string(&progress).unwrap());
+                                            }
+                                        }
+                                    }
+                                });
                             }
                         }
                     }
