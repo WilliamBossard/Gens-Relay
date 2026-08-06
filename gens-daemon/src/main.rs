@@ -349,7 +349,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         let udp_token = auth_token.clone();
                                         
                                         tokio::spawn(async move {
-                                            let broadcast_addr = env::var("BROADCAST_ADDR").unwrap_or_else(|_| "255.255.255.255:8888".to_string());
+                                            let broadcast_addrs = env::var("BROADCAST_ADDR")
+                                                .map(|a| vec![a])
+                                                .unwrap_or_else(|_| vec![
+                                                    "255.255.255.255:8888".to_string(),
+                                                    "192.168.1.255:8888".to_string(),
+                                                    "192.168.0.255:8888".to_string(),
+                                                    "10.0.0.255:8888".to_string(),
+                                                ]);
                                             if let Ok(socket) = UdpSocket::bind("0.0.0.0:0").await {
                                                 if socket.set_broadcast(true).is_ok() {
                                                     let packet = serde_json::to_string(&DiscoveryPacket { 
@@ -358,7 +365,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                         token: udp_token 
                                                     }).unwrap();
                                                     loop {
-                                                        let _ = socket.send_to(packet.as_bytes(), &broadcast_addr).await;
+                                                        for addr in &broadcast_addrs {
+                                                            let _ = socket.send_to(packet.as_bytes(), addr).await;
+                                                        }
                                                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                                                     }
                                                 }
@@ -427,11 +436,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         };
                         let _ = state.ipc_tx.send(serde_json::to_string(&event).unwrap());
                     }
-                    action @ "connect" | action @ "p2p" | action @ "sendfile" | action @ "ls" | action @ "download_req" => {
+                    action @ "connect" | action @ "p2p" | action @ "sendfile" | action @ "ls" | action @ "download_req" | action @ "add_peer" => {
                         if let Some(raw_target) = cmd.target {
                             let target_id = resolve_target(&raw_target, &state_console).await;
                             
                             match action {
+                                "add_peer" => {
+                                    if let Some(ip) = cmd.msg {
+                                        let mut peers = state.local_peers.lock().await;
+                                        peers.insert(ip.clone(), PeerInfo {
+                                            id: raw_target.clone(),
+                                            ip: ip.clone(),
+                                        });
+                                        println!("[Daemon] Manual peer added: {} (IP: {})", raw_target, ip);
+                                        
+                                        let mut peer_list = Vec::new();
+                                        for (host, info) in peers.iter() {
+                                            peer_list.push(serde_json::json!({"hostname": host, "id": &info.id, "ip": &info.ip}));
+                                        }
+                                        let event = IpcEvent {
+                                            event: "peers_updated".to_string(),
+                                            data: serde_json::json!({"peers": peer_list}),
+                                        };
+                                        let _ = state.ipc_tx.send(serde_json::to_string(&event).unwrap());
+                                    }
+                                }
                                 "connect" => {
                                     println!("[WebRTC] Initiating connection to {} (ID: {})...", raw_target, target_id);
                                     let pc = create_peer_connection(&api, target_id.clone(), state.clone()).await?;

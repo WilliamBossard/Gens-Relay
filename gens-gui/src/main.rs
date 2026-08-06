@@ -169,11 +169,30 @@ struct MyApp {
     remote_current_path: String,
     remote_parent_path: String,
     remote_entries: Vec<Value>,
+    
+    show_manual_peer_modal: bool,
+    manual_peer_id: String,
+    manual_peer_ip: String,
 }
 
 impl MyApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        let mut visuals = egui::Visuals::dark();
+        visuals.window_fill = egui::Color32::from_rgb(30, 30, 30);
+        visuals.panel_fill = egui::Color32::from_rgb(25, 25, 25);
+        visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(35, 35, 35);
+        visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(45, 45, 45);
+        visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(60, 60, 60);
+        visuals.widgets.active.bg_fill = egui::Color32::from_rgb(80, 80, 80);
+        visuals.widgets.inactive.rounding = egui::Rounding::same(6.0);
+        visuals.widgets.hovered.rounding = egui::Rounding::same(6.0);
+        visuals.widgets.active.rounding = egui::Rounding::same(6.0);
+        
+        let mut style = egui::Style::default();
+        style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+        style.spacing.window_margin = egui::Margin::same(12.0);
+        style.visuals = visuals;
+        cc.egui_ctx.set_style(style);
 
         let (cmd_tx, cmd_rx) = channel::<String>();
         let (event_tx, event_rx) = channel::<String>();
@@ -207,6 +226,10 @@ impl MyApp {
             remote_current_path: String::new(),
             remote_parent_path: String::new(),
             remote_entries: Vec::new(),
+            
+            show_manual_peer_modal: false,
+            manual_peer_id: String::new(),
+            manual_peer_ip: String::new(),
         }
     }
     
@@ -407,7 +430,42 @@ impl eframe::App for MyApp {
             return;
         }
 
-        egui::TopBottomPanel::top("top_panel").frame(egui::Frame::default().fill(egui::Color32::from_rgb(30, 30, 30)).inner_margin(10.0)).show(ctx, |ui| {
+        if self.show_manual_peer_modal {
+            egui::Window::new("Add Manual Peer")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label("Enter peer details to connect directly (bypassing UDP).");
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Peer ID:");
+                        ui.add(egui::TextEdit::singleline(&mut self.manual_peer_id).desired_width(150.0));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Peer IP Address:");
+                        ui.add(egui::TextEdit::singleline(&mut self.manual_peer_ip).desired_width(150.0));
+                    });
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Add Peer").clicked() {
+                            self.send_command(IpcCommand {
+                                action: "add_peer".into(),
+                                target: Some(self.manual_peer_id.clone()),
+                                msg: Some(self.manual_peer_ip.clone()),
+                                path: None,
+                            });
+                            self.show_manual_peer_modal = false;
+                            self.manual_peer_id.clear();
+                            self.manual_peer_ip.clear();
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.show_manual_peer_modal = false;
+                        }
+                    });
+                });
+        }
+        
+        egui::TopBottomPanel::top("top_panel").frame(egui::Frame::default().fill(egui::Color32::from_rgb(51, 51, 51)).inner_margin(10.0)).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading(egui::RichText::new("Gens-Relay").strong().size(20.0).color(egui::Color32::WHITE));
                 
@@ -431,13 +489,18 @@ impl eframe::App for MyApp {
             });
         });
 
-        egui::SidePanel::left("left_panel").frame(egui::Frame::default().fill(egui::Color32::from_rgb(40, 40, 40)).inner_margin(10.0)).resizable(true).min_width(200.0).show(ctx, |ui| {
+        egui::SidePanel::left("left_panel").frame(egui::Frame::default().fill(egui::Color32::from_rgb(37, 37, 38)).inner_margin(10.0)).resizable(true).min_width(200.0).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Directory");
                 if ui.button("🔄").on_hover_text("Refresh").clicked() {
                     self.send_command(IpcCommand { action: "list".into(), target: None, msg: None, path: None });
                 }
             });
+            ui.add_space(10.0);
+            
+            if ui.button("+ Add Manual Peer").clicked() {
+                self.show_manual_peer_modal = true;
+            }
             ui.add_space(10.0);
 
             if self.peers.is_empty() {
@@ -482,7 +545,7 @@ impl eframe::App for MyApp {
             }
         });
 
-        egui::CentralPanel::default().frame(egui::Frame::default().fill(egui::Color32::from_rgb(50, 50, 50)).inner_margin(20.0)).show(ctx, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::default().fill(egui::Color32::from_rgb(51, 51, 51)).inner_margin(20.0)).show(ctx, |ui| {
             if let Some(target) = self.selected_target.clone() {
                 let display_name = self.prefs.aliases.get(&target).cloned().unwrap_or_else(|| target.clone());
                 
