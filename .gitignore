@@ -6,10 +6,13 @@ target_run*/
 # Environnement / Secrets
 .env
 .env.*
+!.env.example
 
 # Données d'application
 /downloads/
 /gens-daemon/downloads/
+.ipc_port
+prefs.json
 
 # IDE et OS
 node_modules/
