@@ -797,7 +797,7 @@ async fn setup_data_channel(data_channel: &Arc<RTCDataChannel>, target_id: Strin
                                                         let mut _handled = false;
                                                         
                                                         if it == Some("file_start") {
-                                                            handled = true;
+                                                            _handled = true;
                                                             if let Some(name) = inner_json.get("name").and_then(|n| n.as_str()) {
                                                                 println!("[File] Starting secure reception: {} from {}...", name, target2);
                                                                 let safe_name = name.replace("..", "").replace("/", "").replace("\\", "");
