@@ -1,0 +1,134 @@
+name: CI & Release
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build Web UI & Relay Admin UI
+        run: |
+          cd web && (npm ci || npm install) && npm run build
+          cd ../relay-web && (npm ci || npm install) && npm run build
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+      - name: Go Vet & Race Tests
+        run: |
+          go vet ./...
+          go test -race -count=1 ./...
+
+  build-binaries:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Build Web UI & Relay Admin UI
+        run: |
+          cd web && (npm ci || npm install) && npm run build
+          cd ../relay-web && (npm ci || npm install) && npm run build
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+      - name: Build cross-platform Go binaries (including Windows CLI without UI)
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o dist/gens-daemon-windows-amd64.exe ./cmd/gens-daemon
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o dist/relay-server-windows-amd64.exe ./cmd/relay-server
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o dist/gens-daemon-linux-amd64 ./cmd/gens-daemon
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o dist/relay-server-linux-amd64 ./cmd/relay-server
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o dist/gens-daemon-linux-arm64 ./cmd/gens-daemon
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o dist/relay-server-linux-arm64 ./cmd/relay-server
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          files: dist/*
+
+  build-windows-desktop:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build Web UIs & Windows Sidecars
+        shell: pwsh
+        run: |
+          cd web && npm install && npm run build
+          cd ../relay-web && npm install && npm run build
+          cd ..
+          New-Item -ItemType Directory -Force -Path desktop/src-tauri/binaries | Out-Null
+          New-Item -ItemType Directory -Force -Path relay-desktop/src-tauri/binaries | Out-Null
+          $env:CGO_ENABLED = "0"
+          go build -ldflags="-s -w" -o desktop/src-tauri/binaries/gens-daemon-x86_64-pc-windows-msvc.exe ./cmd/gens-daemon
+          go build -ldflags="-s -w" -o relay-desktop/src-tauri/binaries/relay-server-x86_64-pc-windows-msvc.exe ./cmd/relay-server
+      - name: Build Tauri Desktop Bundles (Daemon UI + Relay Server UI)
+        shell: pwsh
+        run: |
+          cd desktop/src-tauri
+          cargo tauri build --no-bundle
+          cd ../../relay-desktop/src-tauri
+          cargo tauri build --no-bundle
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          files: |
+            desktop/src-tauri/target/release/gens-relay-desktop.exe
+            relay-desktop/src-tauri/target/release/gens-relay-server-desktop.exe
+
+  docker:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile.daemon
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/gens-relay-daemon:latest
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile.server
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/gens-relay-server:latest

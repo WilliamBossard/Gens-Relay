@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Gens-Relay minimisé</title>
+    <style>
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        padding: 12px 14px;
+        height: 100vh;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        background: #10131a;
+        border: 1px solid #27272a;
+        color: #f4f4f5;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        overflow: hidden;
+        user-select: none;
+      }
+      .badge {
+        width: 34px;
+        height: 34px;
+        border-radius: 8px;
+        background: #2563eb;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-weight: 700;
+        font-size: 13px;
+        color: #fff;
+        flex-shrink: 0;
+      }
+      .text {
+        min-width: 0;
+      }
+      .title {
+        font-size: 13px;
+        font-weight: 600;
+        color: #f4f4f5;
+        margin-bottom: 3px;
+      }
+      .desc {
+        font-size: 11.5px;
+        line-height: 1.35;
+        color: #a1a1aa;
+      }
+      .bar {
+        position: fixed;
+        bottom: 0;
+        left: 0;
+        height: 2px;
+        background: #3b82f6;
+        width: 100%;
+        animation: shrink 4s linear forwards;
+      }
+      @keyframes shrink {
+        from { width: 100%; }
+        to { width: 0%; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="badge">GR</div>
+    <div class="text">
+      <div class="title">Gens-Relay est minimisé</div>
+      <div class="desc">La synchronisation continue dans la zone de notification. Relancez ou cliquez sur l'icône pour rouvrir.</div>
+    </div>
+    <div class="bar"></div>
+  </body>
+</html>

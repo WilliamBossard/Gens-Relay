@@ -1,0 +1,34 @@
+name: gens-relay
+app_version: 2.0.0
+version: 1.0.0
+title: Gens-Relay
+description: Synchronisation P2P continue et envoi instantané QuickDrop sur QUIC/mTLS sans stockage sur serveur central.
+categories:
+  - storage
+  - backup
+maintainers:
+  - name: WilliamBossard
+    email: ""
+home: https://github.com/WilliamBossard/Gens-Relay
+tags:
+  - sync
+  - syncthing
+  - drop
+  - p2p
+  - quic
+run_as_context:
+  - user_name: root
+    group_name: root
+    gid: 0
+    uid: 0
+    description: Accès aux datasets montés sur TrueNAS SCALE
+port_forwarding_notes:
+  - port: 8385
+    protocol: TCP
+    description: Interface Web UI Gens-Relay
+  - port: 22000
+    protocol: UDP
+    description: Transport P2P QUIC mTLS
+  - port: 21027
+    protocol: UDP
+    description: Découverte locale LAN

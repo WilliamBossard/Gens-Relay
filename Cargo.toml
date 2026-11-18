@@ -1,6 +1,0 @@
-[workspace]
-members = [
-    "gens-daemon",
-    "gens-gui/src-tauri"
-]
-resolver = "2"

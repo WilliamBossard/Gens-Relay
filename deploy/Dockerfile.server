@@ -1,0 +1,30 @@
+FROM node:22-alpine AS webbuild
+WORKDIR /app/relay-web
+COPY relay-web/package.json relay-web/package-lock.json* ./
+RUN npm install
+COPY relay-web/ .
+RUN npm run build
+
+FROM golang:1.27-alpine AS gobuild
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd ./cmd
+COPY pkg ./pkg
+COPY internal ./internal
+COPY relay-web/embed.go ./relay-web/embed.go
+COPY --from=webbuild /app/relay-web/dist ./relay-web/dist
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /relay-server ./cmd/relay-server
+
+FROM alpine:3.21
+RUN apk add --no-cache ca-certificates wget && adduser -D -H -u 1000 gens
+COPY --from=gobuild /relay-server /usr/local/bin/relay-server
+RUN mkdir -p /config && chown -R gens:gens /config
+USER gens
+ENV RELAY_LISTEN=:38420
+ENV RELAY_DATA_DIR=/config
+ENV RELAY_ADMIN_LISTEN=0.0.0.0:38421
+VOLUME ["/config"]
+EXPOSE 38420/tcp 38420/udp 38421/tcp
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 CMD wget -qO- http://127.0.0.1:38420/healthz >/dev/null || exit 1
+ENTRYPOINT ["/usr/local/bin/relay-server"]

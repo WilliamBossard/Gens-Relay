@@ -1,0 +1,21 @@
+﻿services:
+  gens-daemon:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.daemon
+    container_name: gens-relay-daemon
+    restart: unless-stopped
+    # Sur TrueNAS SCALE, network_mode: host permet la découverte LAN UDP (:21027) et QUIC (:22000) sans NAT
+    network_mode: host
+    environment:
+      NODE_NAME: TrueNAS-SCALE
+      GENS_DATA_DIR: /config
+      GENS_WEB_LISTEN: 0.0.0.0:8385
+      GENS_DROP_INBOX: /data/inbox
+      # Optionnel : décommenter pour connecter au relay-server
+      # RELAY_URL: ws://192.168.1.10:38420/ws
+      # AUTH_TOKEN: secret_token
+    volumes:
+      - ./config:/config
+      - /mnt/tank/sync:/data/sync
+      - /mnt/tank/inbox:/data/inbox

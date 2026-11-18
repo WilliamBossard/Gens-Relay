@@ -1,0 +1,16 @@
+﻿[Unit]
+Description=Gens-Relay P2P Sync & Drop Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+Environment=GENS_DATA_DIR=/home/%i/.config/Gens-Relay
+Environment=GENS_WEB_LISTEN=127.0.0.1:8385
+ExecStart=/usr/local/bin/gens-daemon
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
