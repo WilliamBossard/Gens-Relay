@@ -41,6 +41,9 @@ export type Folder = {
   paused: boolean;
   ignore_patterns: string;
   peers: string[];
+  min_free_disk_mb?: number;
+  trashcan_max_days?: number;
+  trashcan_max_mb?: number;
 };
 
 export type FolderStatus = {
@@ -56,6 +59,18 @@ export type FolderStatus = {
   tx_bps?: number;
   last_scan_at: number;
   last_error?: string;
+  case_collisions?: string[];
+};
+
+export type FolderInvitation = {
+  folder_id: string;
+  sender_id: string;
+  sender_name: string;
+  label: string;
+  suggested_mode: string;
+  file_count: number;
+  total_bytes: number;
+  created_at: number;
 };
 
 export type DropTransfer = {
@@ -79,15 +94,40 @@ export type DaemonStatus = {
   quic_port: number;
   lan_addrs: string[];
   relay_url: string;
+  relay_urls?: string[];
+  active_relay_url?: string;
+  relay_transport_mode?: string;
   relay_connected: boolean;
   has_auth_token?: boolean;
   has_web_password?: boolean;
   drop_inbox_dir: string;
   max_upload_kbps: number;
   max_download_kbps: number;
+  enable_upnp?: boolean;
+  enable_compression?: boolean;
   web_listen: string;
   web_tls: boolean;
   web_user: string;
+  is_loopback?: boolean;
+};
+
+export type SetupStatus = {
+  needs_setup: boolean;
+  is_loopback: boolean;
+  web_user?: string;
+  node_name?: string;
+  drop_inbox_dir?: string;
+  relay_url?: string;
+};
+
+export type CompanionAppsInfo = {
+  desktop_installed: boolean;
+  drop_installed: boolean;
+  installer_available: boolean;
+  desktop_path?: string;
+  drop_path?: string;
+  installer_path?: string;
+  is_loopback?: boolean;
 };
 
 export type LogEntry = {
@@ -132,4 +172,16 @@ export function formatBytes(bytes: number): string {
     i++;
   }
   return `${val.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+export function isTauriRuntime(): boolean {
+  return typeof window !== "undefined" && !!(window as any).__TAURI_INTERNALS__;
+}
+
+export async function invokeTauri(cmd: string, args?: Record<string, unknown>): Promise<unknown> {
+  const internals = (window as any).__TAURI_INTERNALS__;
+  if (!internals?.invoke) {
+    throw new Error("Tauri runtime unavailable");
+  }
+  return internals.invoke(cmd, args);
 }

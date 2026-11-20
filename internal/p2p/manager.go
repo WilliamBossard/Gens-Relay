@@ -3,6 +3,7 @@ package p2p
 import (
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,7 +30,7 @@ type PeerRuntimeStatus struct {
 	Name         string   `json:"name"`
 	Connected    bool     `json:"connected"`
 	RelayOnline  bool     `json:"relay_online"`
-	Route        string   `json:"route"` // "lan" | "wan" | "offline"
+	Route        string   `json:"route"` // "lan" | "wan" | "relay" | "offline"
 	RemoteAddr   string   `json:"remote_addr,omitempty"`
 	LANAddrs     []string `json:"lan_addrs,omitempty"`
 	ObservedAddr string   `json:"observed_addr,omitempty"`
@@ -59,6 +60,13 @@ type peerSession struct {
 	activeStreams  atomic.Int32
 }
 
+var relayWireBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 4096+300)
+		return &b
+	},
+}
+
 type Manager struct {
 	id       *protocol.Identity
 	cfg      *config.DaemonConfig
@@ -66,13 +74,14 @@ type Manager struct {
 	handlers Handlers
 	rootCtx  context.Context
 
-	udpConn       *net.UDPConn
-	directTr      *quic.Transport
-	relayTr       *quic.Transport
-	pktConn       *relayPacketConn
-	directListen  *quic.Listener
-	relayListen   *quic.Listener
-	quicPort      int
+	udpConn      *net.UDPConn
+	directTr     *quic.Transport
+	relayTr      *quic.Transport
+	pktConn      *relayPacketConn
+	directListen *quic.Listener
+	relayListen  *quic.Listener
+	quicPort     int
+	stopNAT      func()
 
 	mu             sync.RWMutex
 	sessions       map[string]*peerSession
@@ -85,7 +94,14 @@ type Manager struct {
 	relayMu        sync.Mutex
 	relayWriteMu   sync.Mutex
 	relayConn      bool
+	activeRelayURL string
+	stunToken      string
+	udpRelayConn   *net.UDPConn
+	udpRelayAddr   *net.UDPAddr
+	udpRelayToken  [16]byte
+	udpRelayReady  atomic.Bool
 	forceRelayOnly bool
+	forceWSRelay   bool
 
 	pairCodeCh     chan protocol.SignalingMessage
 	pairResolvedCh chan protocol.SignalingMessage
@@ -114,6 +130,19 @@ func NewManager(id *protocol.Identity, cfg *config.DaemonConfig, st *store.Store
 	}
 	m.RefreshRateLimiters()
 	return m
+}
+
+func newQUICConfig(isRelay bool) *quic.Config {
+	return &quic.Config{
+		KeepAlivePeriod:                10 * time.Second,
+		MaxIdleTimeout:                 45 * time.Second,
+		InitialStreamReceiveWindow:     2 << 20,
+		MaxStreamReceiveWindow:         32 << 20,
+		InitialConnectionReceiveWindow: 8 << 20,
+		MaxConnectionReceiveWindow:     128 << 20,
+		MaxIncomingStreams:             256,
+		DisablePathMTUDiscovery:        isRelay,
+	}
 }
 
 func (m *Manager) RefreshRateLimiters() {
@@ -161,7 +190,7 @@ func (m *Manager) WaitLimit(ctx context.Context, upload bool, n int) error {
 	return nil
 }
 
-// LimitedReadFrom reads up to len(p) from r while enforcing download rate limits in 32 KiB chunks.
+// LimitedReadFull reads len(p) bytes from r while enforcing download rate limits in 32 KiB chunks.
 func (m *Manager) LimitedReadFull(ctx context.Context, r io.Reader, p []byte) (int, error) {
 	const chunk = 32 * 1024
 	total := 0
@@ -207,10 +236,36 @@ func (m *Manager) QUICPort() int {
 	return m.quicPort
 }
 
+func (m *Manager) CompressionEnabled() bool {
+	return m.cfg.Snapshot().EnableCompression
+}
+
 func (m *Manager) RelayConnected() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.relayConn
+}
+
+func (m *Manager) ActiveRelayURL() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if !m.relayConn {
+		return ""
+	}
+	return m.activeRelayURL
+}
+
+func (m *Manager) RelayTransportMode() string {
+	m.mu.RLock()
+	conn := m.relayConn
+	m.mu.RUnlock()
+	if !conn {
+		return "none"
+	}
+	if m.udpRelayReady.Load() {
+		return "udp"
+	}
+	return "ws"
 }
 
 func (m *Manager) Start(ctx context.Context) error {
@@ -230,8 +285,8 @@ func (m *Manager) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("listen udp: %w", err)
 	}
-	_ = udpConn.SetReadBuffer(4 * 1024 * 1024)
-	_ = udpConn.SetWriteBuffer(4 * 1024 * 1024)
+	_ = udpConn.SetReadBuffer(8 * 1024 * 1024)
+	_ = udpConn.SetWriteBuffer(8 * 1024 * 1024)
 
 	m.udpConn = udpConn
 	m.quicPort = udpConn.LocalAddr().(*net.UDPAddr).Port
@@ -241,12 +296,8 @@ func (m *Manager) Start(ctx context.Context) error {
 	m.relayTr = &quic.Transport{Conn: m.pktConn}
 
 	tlsConf := m.id.ServerTLSConfig(m.store.IsDeviceAllowed)
-	quicConf := &quic.Config{
-		KeepAlivePeriod: 10 * time.Second,
-		MaxIdleTimeout:  45 * time.Second,
-	}
 
-	dLn, err := m.directTr.Listen(tlsConf, quicConf)
+	dLn, err := m.directTr.Listen(tlsConf, newQUICConfig(false))
 	if err != nil {
 		_ = m.directTr.Close()
 		_ = m.pktConn.Close()
@@ -254,11 +305,7 @@ func (m *Manager) Start(ctx context.Context) error {
 	}
 	m.directListen = dLn
 
-	rLn, err := m.relayTr.Listen(tlsConf, &quic.Config{
-		KeepAlivePeriod:         10 * time.Second,
-		MaxIdleTimeout:          45 * time.Second,
-		DisablePathMTUDiscovery: true,
-	})
+	rLn, err := m.relayTr.Listen(tlsConf, newQUICConfig(true))
 	if err != nil {
 		_ = dLn.Close()
 		_ = m.directTr.Close()
@@ -267,7 +314,11 @@ func (m *Manager) Start(ctx context.Context) error {
 	}
 	m.relayListen = rLn
 
-	log.Printf("[p2p] QUIC listening on UDP :%d (DeviceID: %s)", m.quicPort, m.id.DeviceID)
+	log.Printf("[p2p] QUIC listening on UDP :%d (ALPN: %s, DeviceID: %s)", m.quicPort, protocol.ALPNProtocol, m.id.DeviceID)
+
+	if m.cfg.Snapshot().EnableUPnP && m.cfg.Snapshot().QUICPort > 0 {
+		m.stopNAT = StartNATMapping(ctx, m.quicPort)
+	}
 
 	go m.acceptLoop(ctx, dLn)
 	go m.acceptLoop(ctx, rLn)
@@ -277,14 +328,79 @@ func (m *Manager) Start(ctx context.Context) error {
 
 	go func() {
 		<-ctx.Done()
-		_ = dLn.Close()
-		_ = rLn.Close()
-		_ = m.directTr.Close()
-		_ = m.relayTr.Close()
-		_ = m.pktConn.Close()
-		_ = udpConn.Close()
+		m.Shutdown(context.Background())
 	}()
 	return nil
+}
+
+// Shutdown cleanly closes NAT mappings, active peer sessions, listeners, and sockets.
+func (m *Manager) Shutdown(_ context.Context) {
+	if m.stopNAT != nil {
+		m.stopNAT()
+	}
+
+	m.mu.Lock()
+	sessions := make([]*peerSession, 0, len(m.sessions))
+	for id, sess := range m.sessions {
+		sessions = append(sessions, sess)
+		delete(m.sessions, id)
+	}
+	rConn := m.udpRelayConn
+	m.udpRelayConn = nil
+	m.mu.Unlock()
+
+	for _, sess := range sessions {
+		_ = sess.conn.CloseWithError(0, "daemon shutdown")
+	}
+
+	m.relayMu.Lock()
+	ws := m.relayWS
+	m.relayMu.Unlock()
+	if ws != nil {
+		_ = ws.Close(websocket.StatusGoingAway, "daemon shutdown")
+	}
+	if rConn != nil {
+		_ = rConn.Close()
+	}
+	if m.directListen != nil {
+		_ = m.directListen.Close()
+	}
+	if m.relayListen != nil {
+		_ = m.relayListen.Close()
+	}
+	if m.directTr != nil {
+		_ = m.directTr.Close()
+	}
+	if m.relayTr != nil {
+		_ = m.relayTr.Close()
+	}
+	if m.pktConn != nil {
+		_ = m.pktConn.Close()
+	}
+	if m.udpConn != nil {
+		_ = m.udpConn.Close()
+	}
+}
+
+// DisconnectPeer immediately terminates any active QUIC session and clears dial hints for a removed device.
+func (m *Manager) DisconnectPeer(peerID string) {
+	norm := protocol.NormalizeDeviceID(peerID)
+	m.mu.Lock()
+	sess, ok := m.sessions[norm]
+	if ok {
+		delete(m.sessions, norm)
+	}
+	delete(m.hints, norm)
+	delete(m.dialNextAt, norm)
+	delete(m.dialFailures, norm)
+	m.mu.Unlock()
+
+	if ok && sess != nil {
+		_ = sess.conn.CloseWithError(4, "peer removed")
+	}
+	if m.handlers.OnPeerState != nil {
+		m.handlers.OnPeerState()
+	}
 }
 
 func (m *Manager) acceptLoop(ctx context.Context, ln *quic.Listener) {
@@ -332,13 +448,11 @@ func (m *Manager) registerSession(ctx context.Context, peerID string, conn *quic
 	if old, ok := m.sessions[peerID]; ok && old.conn != conn {
 		oldAlive := old.conn.Context().Err() == nil
 		if oldAlive && old.route != "relay" && route == "relay" {
-			// Keep existing direct LAN/WAN session instead of downgrading to relay
 			m.mu.Unlock()
 			_ = conn.CloseWithError(0, "prefer direct session")
 			return
 		}
 		if oldAlive && route == old.route && now.Sub(old.connectedAt) < 3*time.Second {
-			// Simultaneous dial tie-breaker: smaller DeviceID initiates (outgoing wins on smaller local ID)
 			keepNew := isIncoming == (peerID < m.id.DeviceID)
 			if !keepNew {
 				m.mu.Unlock()
@@ -347,7 +461,6 @@ func (m *Manager) registerSession(ctx context.Context, peerID string, conn *quic
 			}
 		}
 		if oldAlive && old.route == "relay" && route != "relay" && old.activeStreams.Load() > 0 {
-			// Drain in-flight transfers on the relay connection instead of aborting active streams mid-flight
 			drainingOld = old
 		} else {
 			_ = old.conn.CloseWithError(0, "replaced")
@@ -510,9 +623,13 @@ func (m *Manager) SendControl(peerID, msgType string, payload any) error {
 		sess.ctrlStream = stream
 		go m.readControlLoop(m.rootCtx, sess, stream)
 	}
-	_ = sess.ctrlStream.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	_ = sess.ctrlStream.SetWriteDeadline(time.Now().Add(8 * time.Second))
 	err := protocol.WriteControlEnvelope(sess.ctrlStream, msgType, payload)
 	_ = sess.ctrlStream.SetWriteDeadline(time.Time{})
+	if err != nil {
+		// Prevent permanent framing desynchronization after partial write or deadline timeout
+		_ = sess.conn.CloseWithError(3, "control stream write failed")
+	}
 	return err
 }
 
@@ -521,7 +638,6 @@ func (m *Manager) OpenDataStream(ctx context.Context, peerID string, reqKind pro
 	if err != nil {
 		return nil, err
 	}
-	// Release immediately if caller doesn't use OpenTrackedDataStream; callers wanting drain safety use OpenTrackedDataStream.
 	release()
 	return stream, nil
 }
@@ -646,7 +762,6 @@ func (m *Manager) reconnectLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			tickCount++
-			// Periodically prune expired LAN nearby peers (>60s)
 			if tickCount%4 == 0 {
 				m.pruneNearbyLAN()
 			}
@@ -667,7 +782,6 @@ func (m *Manager) reconnectLoop(ctx context.Context) {
 						go m.tryConnectPeer(ctx, dev.DeviceID)
 					}
 				} else if isRelay && !forceRelay && tickCount%4 == 0 {
-					// Periodically attempt upgrading an active relay session to direct LAN/WAN
 					go m.tryConnectPeerOpt(ctx, dev.DeviceID, true)
 				}
 			}
@@ -749,7 +863,6 @@ func (m *Manager) tryConnectPeerOpt(ctx context.Context, peerID string, directUp
 		return
 	}
 
-	// Happy-Eyeballs style concurrent dialing: LAN first, WAN 150ms later, Relay 650ms later.
 	type dialAttempt struct {
 		addr  net.Addr
 		delay time.Duration
@@ -812,11 +925,7 @@ func (m *Manager) tryConnectPeerOpt(ctx context.Context, peerID string, directUp
 			if isRelay {
 				tr = m.relayTr
 			}
-			conn, err := tr.Dial(attemptCtx, targetAddr, m.id.ClientTLSConfig(peerID), &quic.Config{
-				KeepAlivePeriod:         10 * time.Second,
-				MaxIdleTimeout:          45 * time.Second,
-				DisablePathMTUDiscovery: isRelay,
-			})
+			conn, err := tr.Dial(attemptCtx, targetAddr, m.id.ClientTLSConfig(peerID), newQUICConfig(isRelay))
 			attemptCancel()
 			if err != nil {
 				return
@@ -879,9 +988,8 @@ func (m *Manager) recordDialFailure(peerID string) {
 	m.dialNextAt[peerID] = time.Now().Add(backoff)
 }
 
-// --- Relay Signaling Client ---
+// --- Relay Signaling Client (Multi-Relay Failover + Native UDP Relay) ---
 
-// RestartRelay interrupts any current relay connection/backoff and reconnects immediately with updated config.
 func (m *Manager) RestartRelay() {
 	m.relayMu.Lock()
 	ws := m.relayWS
@@ -897,12 +1005,16 @@ func (m *Manager) RestartRelay() {
 
 func (m *Manager) runRelayClient(ctx context.Context) {
 	backoff := 2 * time.Second
+	relayIdx := 0
+	failInCycle := 0
+
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 		snap := m.cfg.Snapshot()
-		if snap.RelayURL == "" {
+		urls := snap.EffectiveRelayURLs()
+		if len(urls) == 0 {
 			t := time.NewTimer(5 * time.Second)
 			select {
 			case <-ctx.Done():
@@ -911,12 +1023,15 @@ func (m *Manager) runRelayClient(ctx context.Context) {
 			case <-m.relayRestartCh:
 				t.Stop()
 				backoff = 2 * time.Second
+				relayIdx = 0
+				failInCycle = 0
 				continue
 			case <-t.C:
 				continue
 			}
 		}
 
+		targetURL := urls[relayIdx%len(urls)]
 		connCtx, connCancel := context.WithCancel(ctx)
 		doneWatcher := make(chan struct{})
 		var restarted atomic.Bool
@@ -930,19 +1045,52 @@ func (m *Manager) runRelayClient(ctx context.Context) {
 			}
 		}()
 
-		err := m.connectAndServeRelay(connCtx, snap)
+		startedAt := time.Now()
+		err := m.connectAndServeRelay(connCtx, snap, targetURL)
 		close(doneWatcher)
 		connCancel()
-		m.setRelayConnected(false)
+		m.setRelayConnected(false, "")
 		if ctx.Err() != nil {
 			return
 		}
 		if restarted.Load() {
 			backoff = 2 * time.Second
+			relayIdx = 0
+			failInCycle = 0
 			continue
 		}
+
+		if time.Since(startedAt) >= 15*time.Second {
+			backoff = 2 * time.Second
+			failInCycle = 0
+		}
+
+		if len(urls) > 1 {
+			relayIdx = (relayIdx + 1) % len(urls)
+			failInCycle++
+			if failInCycle < len(urls) {
+				if err != nil && !errors.Is(err, context.Canceled) {
+					log.Printf("[relay-client] %s failed (%v); failing over to next relay...", targetURL, err)
+				}
+				t := time.NewTimer(500 * time.Millisecond)
+				select {
+				case <-ctx.Done():
+					t.Stop()
+					return
+				case <-m.relayRestartCh:
+					t.Stop()
+					backoff = 2 * time.Second
+					failInCycle = 0
+					continue
+				case <-t.C:
+					continue
+				}
+			}
+			failInCycle = 0
+		}
+
 		if err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("[relay-client] Disconnected (%v). Reconnecting in %v...", err, backoff)
+			log.Printf("[relay-client] Disconnected from %s (%v). Reconnecting in %v...", targetURL, err, backoff)
 		}
 		t := time.NewTimer(backoff)
 		select {
@@ -952,6 +1100,7 @@ func (m *Manager) runRelayClient(ctx context.Context) {
 		case <-m.relayRestartCh:
 			t.Stop()
 			backoff = 2 * time.Second
+			failInCycle = 0
 			continue
 		case <-t.C:
 		}
@@ -962,18 +1111,30 @@ func (m *Manager) runRelayClient(ctx context.Context) {
 	}
 }
 
-func (m *Manager) setRelayConnected(ok bool) {
+func (m *Manager) setRelayConnected(ok bool, activeURL string) {
 	m.mu.Lock()
 	m.relayConn = ok
+	if ok {
+		m.activeRelayURL = activeURL
+	} else {
+		m.activeRelayURL = ""
+		m.stunToken = ""
+		m.udpRelayAddr = nil
+		if m.udpRelayConn != nil {
+			_ = m.udpRelayConn.Close()
+			m.udpRelayConn = nil
+		}
+		m.udpRelayReady.Store(false)
+	}
 	m.mu.Unlock()
 	if m.handlers.OnPeerState != nil {
 		m.handlers.OnPeerState()
 	}
 }
 
-func (m *Manager) connectAndServeRelay(ctx context.Context, snap config.Settings) error {
+func (m *Manager) connectAndServeRelay(ctx context.Context, snap config.Settings, relayURL string) error {
 	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	ws, _, err := websocket.Dial(dialCtx, snap.RelayURL, nil)
+	ws, _, err := websocket.Dial(dialCtx, relayURL, nil)
 	cancel()
 	if err != nil {
 		return err
@@ -992,7 +1153,6 @@ func (m *Manager) connectAndServeRelay(ctx context.Context, snap config.Settings
 		m.relayMu.Unlock()
 	}()
 
-	// Expect challenge
 	chMsg, err := readRelayWS(ctx, ws)
 	if err != nil {
 		return err
@@ -1006,13 +1166,18 @@ func (m *Manager) connectAndServeRelay(ctx context.Context, snap config.Settings
 	}
 	sig := m.id.SignChallenge(nonce)
 
+	var authProof string
+	if snap.AuthToken != "" {
+		authProof = protocol.ComputeAuthProof(snap.AuthToken, nonce)
+	}
+
 	if err := m.sendRelayWS(ctx, ws, protocol.SignalingMessage{
 		Type:         protocol.SigRegister,
 		DeviceID:     m.id.DeviceID,
 		Name:         snap.NodeName,
 		PubKeyB64:    base64.StdEncoding.EncodeToString(m.id.PubKeyDER),
 		SignatureB64: base64.StdEncoding.EncodeToString(sig),
-		AuthToken:    snap.AuthToken,
+		AuthProofB64: authProof,
 		LANAddrs:     LocalLANAddrs(m.quicPort),
 		QUICPort:     m.quicPort,
 	}); err != nil {
@@ -1030,32 +1195,82 @@ func (m *Manager) connectAndServeRelay(ctx context.Context, snap config.Settings
 		return fmt.Errorf("expected registered, got %s", regAck.Type)
 	}
 
-	m.setRelayConnected(true)
-	log.Printf("[relay-client] Registered on %s (observed=%s, stun_port=%d)", snap.RelayURL, regAck.ObservedAddr, regAck.STUNPort)
+	wsCtx, wsCancel := context.WithCancel(ctx)
+	defer wsCancel()
 
-	// Send initial UDP STUN probe if relay-server exposes UDP STUN
+	// Setup native UDP Blind Relay socket if advertised by relay-server
+	var udpRelaySendProbe func()
+	if regAck.UDPRelayPort > 0 && regAck.UDPRelayToken != "" && !m.forceWSRelay {
+		if tokBytes, dErr := hex.DecodeString(regAck.UDPRelayToken); dErr == nil && len(tokBytes) == 16 {
+			if u, uErr := url.Parse(relayURL); uErr == nil && u.Hostname() != "" {
+				if rAddr, rErr := net.ResolveUDPAddr("udp", net.JoinHostPort(u.Hostname(), itoa(regAck.UDPRelayPort))); rErr == nil {
+					netProto := "udp4"
+					bindAddr := &net.UDPAddr{IP: net.IPv4zero, Port: 0}
+					if rAddr.IP.To4() == nil {
+						netProto = "udp6"
+						bindAddr = &net.UDPAddr{IP: net.IPv6zero, Port: 0}
+					}
+					if rConn, lErr := net.ListenUDP(netProto, bindAddr); lErr == nil {
+						_ = rConn.SetReadBuffer(4 * 1024 * 1024)
+						_ = rConn.SetWriteBuffer(4 * 1024 * 1024)
+						var tok [16]byte
+						copy(tok[:], tokBytes)
+						m.mu.Lock()
+						m.udpRelayConn = rConn
+						m.udpRelayAddr = rAddr
+						m.udpRelayToken = tok
+						m.stunToken = regAck.STUNToken
+						m.mu.Unlock()
+
+						go func() {
+							<-wsCtx.Done()
+							_ = rConn.Close()
+						}()
+						go m.readUDPRelayLoop(wsCtx, rConn, tok)
+
+						udpRelaySendProbe = func() {
+							probe := protocol.EncodeUDPRelayPacket(nil, tok, "", nil)
+							_, _ = rConn.WriteToUDP(probe, rAddr)
+						}
+						udpRelaySendProbe()
+					}
+				}
+			}
+		}
+	}
+
+	m.mu.Lock()
+	m.stunToken = regAck.STUNToken
+	m.mu.Unlock()
+	m.setRelayConnected(true, relayURL)
+	log.Printf("[relay-client] Registered on %s (observed=%s, stun_port=%d, udp_relay_port=%d)", relayURL, regAck.ObservedAddr, regAck.STUNPort, regAck.UDPRelayPort)
+
+	// Send authenticated UDP STUN probe from directTr so NAT maps our exact QUIC port
 	sendSTUNProbe := func() {
 		if regAck.STUNPort <= 0 {
 			return
 		}
-		u, err := url.Parse(snap.RelayURL)
+		u, err := url.Parse(relayURL)
 		if err != nil || u.Hostname() == "" {
 			return
 		}
+		probeMsg := "GENSSTUN:" + m.id.DeviceID
+		if regAck.STUNToken != "" {
+			probeMsg += ":" + regAck.STUNToken
+		}
 		if udpAddr, err := net.ResolveUDPAddr("udp4", net.JoinHostPort(u.Hostname(), itoa(regAck.STUNPort))); err == nil {
-			_, _ = m.directTr.WriteTo([]byte("GENSSTUN:"+m.id.DeviceID), udpAddr)
+			_, _ = m.directTr.WriteTo([]byte(probeMsg), udpAddr)
+		} else if udpAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(u.Hostname(), itoa(regAck.STUNPort))); err == nil {
+			_, _ = m.directTr.WriteTo([]byte(probeMsg), udpAddr)
 		}
 	}
 	sendSTUNProbe()
 
-	// Query watched peers immediately and every 20s, keepalive ping every 25s, STUN probe every 25s
 	_ = m.QueryRelayPeers(ctx)
-	wsCtx, wsCancel := context.WithCancel(ctx)
-	defer wsCancel()
 	go func() {
 		queryTicker := time.NewTicker(20 * time.Second)
 		pingTicker := time.NewTicker(25 * time.Second)
-		stunTicker := time.NewTicker(25 * time.Second)
+		stunTicker := time.NewTicker(20 * time.Second)
 		defer queryTicker.Stop()
 		defer pingTicker.Stop()
 		defer stunTicker.Stop()
@@ -1077,6 +1292,9 @@ func (m *Manager) connectAndServeRelay(ctx context.Context, snap config.Settings
 				}
 			case <-stunTicker.C:
 				sendSTUNProbe()
+				if udpRelaySendProbe != nil {
+					udpRelaySendProbe()
+				}
 			}
 		}
 	}()
@@ -1167,7 +1385,7 @@ func (m *Manager) connectAndServeRelay(ctx context.Context, snap config.Settings
 		case protocol.SigPunchNotify:
 			if msg.Peer != nil && m.store.IsDeviceAllowed(msg.Peer.DeviceID) {
 				if msg.Peer.ObservedAddr != "" {
-					if udpAddr, err := net.ResolveUDPAddr("udp4", msg.Peer.ObservedAddr); err == nil {
+					if udpAddr, err := net.ResolveUDPAddr("udp", msg.Peer.ObservedAddr); err == nil {
 						go m.sendPunchBurst(wsCtx, udpAddr)
 					}
 				}
@@ -1184,6 +1402,34 @@ func (m *Manager) connectAndServeRelay(ctx context.Context, snap config.Settings
 			case m.pairResolvedCh <- msg:
 			default:
 			}
+		}
+	}
+}
+
+func (m *Manager) readUDPRelayLoop(ctx context.Context, conn *net.UDPConn, expectedToken [16]byte) {
+	buf := make([]byte, 4096)
+	for {
+		n, _, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		tok, senderID, payload, ok := protocol.DecodeUDPRelayPacket(buf[:n])
+		if !ok || tok != expectedToken {
+			continue
+		}
+		if senderID == "" {
+			if m.udpRelayReady.CompareAndSwap(false, true) {
+				if m.handlers.OnPeerState != nil {
+					m.handlers.OnPeerState()
+				}
+			}
+			continue
+		}
+		if m.pktConn != nil && m.store.IsDeviceAllowed(senderID) {
+			m.pktConn.DeliverRelayPacket(senderID, payload)
 		}
 	}
 }
@@ -1216,7 +1462,6 @@ func (m *Manager) CreatePairCode(ctx context.Context) (string, int, error) {
 	if ws == nil {
 		return "", 0, errors.New("not connected to relay-server (configure RELAY_URL or add DeviceID directly)")
 	}
-	// Drain stale
 	for len(m.pairCodeCh) > 0 {
 		<-m.pairCodeCh
 	}
@@ -1298,27 +1543,62 @@ func (m *Manager) sendRelayPunchRequest(targetID string) {
 }
 
 func (m *Manager) sendBlindRelayPacket(ctx context.Context, targetID string, pkt []byte) error {
+	normID := protocol.NormalizeDeviceID(targetID)
+	if len(normID) == 0 || len(normID) > 255 {
+		return errors.New("invalid target device id")
+	}
+
+	// Prefer native UDP Blind Relay when verified ready (eliminates TCP-over-QUIC meltdown)
+	if m.udpRelayReady.Load() && !m.forceWSRelay {
+		m.mu.RLock()
+		rConn := m.udpRelayConn
+		rAddr := m.udpRelayAddr
+		tok := m.udpRelayToken
+		m.mu.RUnlock()
+		if rConn != nil && rAddr != nil {
+			bufPtr := relayWireBufPool.Get().(*[]byte)
+			frame := protocol.EncodeUDPRelayPacket(*bufPtr, tok, normID, pkt)
+			_, err := rConn.WriteToUDP(frame, rAddr)
+			if cap(frame) <= 8192 {
+				*bufPtr = frame[:cap(frame)]
+				relayWireBufPool.Put(bufPtr)
+			}
+			if err == nil {
+				return nil
+			}
+		}
+	}
+
 	m.relayMu.Lock()
 	ws := m.relayWS
 	m.relayMu.Unlock()
 	if ws == nil {
 		return errors.New("relay websocket not connected")
 	}
-	normID := protocol.NormalizeDeviceID(targetID)
-	if len(normID) == 0 || len(normID) > 255 {
-		return errors.New("invalid target device id")
+
+	need := 2 + len(normID) + len(pkt)
+	bufPtr := relayWireBufPool.Get().(*[]byte)
+	var frame []byte
+	if cap(*bufPtr) >= need {
+		frame = (*bufPtr)[:need]
+	} else {
+		frame = make([]byte, need)
 	}
-	frame := make([]byte, 2+len(normID)+len(pkt))
 	frame[0] = 0x01
 	frame[1] = byte(len(normID))
 	copy(frame[2:], normID)
 	copy(frame[2+len(normID):], pkt)
 
 	m.relayWriteMu.Lock()
-	defer m.relayWriteMu.Unlock()
 	wCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	return ws.Write(wCtx, websocket.MessageBinary, frame)
+	err := ws.Write(wCtx, websocket.MessageBinary, frame)
+	cancel()
+	m.relayWriteMu.Unlock()
+
+	if cap(*bufPtr) <= 8192 {
+		relayWireBufPool.Put(bufPtr)
+	}
+	return err
 }
 
 func (m *Manager) sendRelayWS(ctx context.Context, ws *websocket.Conn, msg protocol.SignalingMessage) error {
@@ -1404,7 +1684,6 @@ func (m *Manager) SendPairRequest(ctx context.Context, targetID, nameHint, endpo
 		return nil
 	}
 
-	// If we already have an incoming request from this device, accept it directly
 	if existing, err := m.store.GetPairRequest(targetID); err == nil && existing.Direction == "incoming" {
 		return m.AcceptPairRequest(ctx, targetID, nameHint)
 	}
@@ -1546,7 +1825,6 @@ func (m *Manager) handleIncomingPairRequest(ctx context.Context, senderID, name,
 		return
 	}
 
-	// Mutual request: if we already sent an outgoing request to senderID, auto-accept!
 	if existing, err := m.store.GetPairRequest(senderID); err == nil && existing.Direction == "outgoing" {
 		_ = m.store.UpsertPairRequest(store.PairRequestRecord{
 			DeviceID:     senderID,

@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/WilliamBossard/Gens-Relay/pkg/protocol"
@@ -32,16 +35,31 @@ type PairRequestRecord struct {
 }
 
 type FolderRecord struct {
-	FolderID       string              `json:"folder_id"`
-	Label          string              `json:"label"`
-	LocalPath      string              `json:"local_path"`
-	Mode           protocol.FolderMode `json:"mode"`
-	Versioning     string              `json:"versioning"`
-	KeepVersions   int                 `json:"keep_versions"`
-	RescanSeconds  int                 `json:"rescan_seconds"`
-	Paused         bool                `json:"paused"`
-	IgnorePatterns string              `json:"ignore_patterns"`
-	Peers          []string            `json:"peers"`
+	FolderID        string              `json:"folder_id"`
+	Label           string              `json:"label"`
+	LocalPath       string              `json:"local_path"`
+	Mode            protocol.FolderMode `json:"mode"`
+	Versioning      string              `json:"versioning"`
+	KeepVersions    int                 `json:"keep_versions"`
+	RescanSeconds   int                 `json:"rescan_seconds"`
+	Paused          bool                `json:"paused"`
+	IgnorePatterns  string              `json:"ignore_patterns"`
+	Peers           []string            `json:"peers"`
+	IndexEpoch      uint64              `json:"index_epoch,omitempty"`
+	MinFreeDiskMB   int                 `json:"min_free_disk_mb"`
+	TrashcanMaxDays int                 `json:"trashcan_max_days"`
+	TrashcanMaxMB   int                 `json:"trashcan_max_mb"`
+}
+
+type FolderInvitationRecord struct {
+	FolderID      string `json:"folder_id"`
+	SenderID      string `json:"sender_id"`
+	SenderName    string `json:"sender_name"`
+	Label         string `json:"label"`
+	SuggestedMode string `json:"suggested_mode"`
+	FileCount     int    `json:"file_count"`
+	TotalBytes    int64  `json:"total_bytes"`
+	CreatedAt     int64  `json:"created_at"`
 }
 
 type DropTransferRecord struct {
@@ -54,9 +72,10 @@ type DropTransferRecord struct {
 	TextContent      string                   `json:"text_content,omitempty"`
 	SourceRoot       string                   `json:"source_root,omitempty"`
 	DestDir          string                   `json:"dest_dir,omitempty"`
+	StagingDir       string                   `json:"staging_dir,omitempty"`
 	TotalSize        int64                    `json:"total_size"`
 	TransferredBytes int64                    `json:"transferred_bytes"`
-	Status           string                   `json:"status"` // "pending_accept" | "transferring" | "paused" | "completed" | "rejected" | "failed"
+	Status           string                   `json:"status"` // "preparing" | "queued_offline" | "pending_accept" | "transferring" | "paused" | "completed" | "rejected" | "canceled" | "failed"
 	Files            []protocol.DropFileEntry `json:"files"`
 	CompletedBlocks  map[string][]int         `json:"completed_blocks"`
 	ErrorMsg         string                   `json:"error_msg,omitempty"`
@@ -65,7 +84,20 @@ type DropTransferRecord struct {
 }
 
 type Store struct {
-	db *sql.DB
+	db     *sql.DB // writer pool (MaxOpenConns=1)
+	readDB *sql.DB // concurrent WAL read-only pool
+
+	allowedMu      sync.RWMutex
+	allowedDevices map[string]struct{}
+}
+
+func buildReadOnlySQLiteURI(dbPath string) string {
+	slashed := filepath.ToSlash(dbPath)
+	prefix := "file:"
+	if runtime.GOOS == "windows" && len(slashed) >= 2 && slashed[1] == ':' {
+		prefix = "file:///"
+	}
+	return prefix + slashed + "?_pragma=query_only(1)&_pragma=busy_timeout(5000)&_pragma=cache_size(-16384)&_pragma=temp_store(MEMORY)"
 }
 
 func Open(dataDir string) (*Store, error) {
@@ -93,19 +125,50 @@ func Open(dataDir string) (*Store, error) {
 		}
 	}
 
-	s := &Store{db: db}
+	s := &Store{
+		db:             db,
+		allowedDevices: make(map[string]struct{}),
+	}
 	if err := s.migrate(); err != nil {
 		_ = db.Close()
+		return nil, err
+	}
+
+	readDB, err := sql.Open("sqlite", buildReadOnlySQLiteURI(dbPath))
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open sqlite read pool: %w", err)
+	}
+	readDB.SetMaxOpenConns(4)
+	if err := readDB.Ping(); err != nil {
+		_ = readDB.Close()
+		_ = db.Close()
+		return nil, fmt.Errorf("ping sqlite read pool: %w", err)
+	}
+	s.readDB = readDB
+
+	if err := s.reloadAllowedDevices(); err != nil {
+		_ = s.Close()
 		return nil, err
 	}
 	return s, nil
 }
 
 func (s *Store) Close() error {
-	if s == nil || s.db == nil {
+	if s == nil {
 		return nil
 	}
-	return s.db.Close()
+	var err1, err2 error
+	if s.readDB != nil {
+		err1 = s.readDB.Close()
+	}
+	if s.db != nil {
+		err2 = s.db.Close()
+	}
+	if err2 != nil {
+		return err2
+	}
+	return err1
 }
 
 func (s *Store) migrate() error {
@@ -127,7 +190,11 @@ func (s *Store) migrate() error {
 		keep_versions INTEGER NOT NULL DEFAULT 5,
 		rescan_seconds INTEGER NOT NULL DEFAULT 60,
 		paused INTEGER NOT NULL DEFAULT 0,
-		ignore_patterns TEXT NOT NULL DEFAULT ''
+		ignore_patterns TEXT NOT NULL DEFAULT '',
+		index_epoch INTEGER NOT NULL DEFAULT 1,
+		min_free_disk_mb INTEGER NOT NULL DEFAULT 0,
+		trashcan_max_days INTEGER NOT NULL DEFAULT 0,
+		trashcan_max_mb INTEGER NOT NULL DEFAULT 0
 	);
 
 	CREATE TABLE IF NOT EXISTS folder_peers (
@@ -136,6 +203,18 @@ func (s *Store) migrate() error {
 		PRIMARY KEY (folder_id, device_id),
 		FOREIGN KEY (folder_id) REFERENCES folders(folder_id) ON DELETE CASCADE,
 		FOREIGN KEY (device_id) REFERENCES devices(device_id) ON DELETE CASCADE
+	);
+
+	CREATE TABLE IF NOT EXISTS folder_invitations (
+		folder_id TEXT NOT NULL,
+		sender_id TEXT NOT NULL,
+		sender_name TEXT NOT NULL DEFAULT '',
+		label TEXT NOT NULL DEFAULT '',
+		suggested_mode TEXT NOT NULL DEFAULT 'send_receive',
+		file_count INTEGER NOT NULL DEFAULT 0,
+		total_bytes INTEGER NOT NULL DEFAULT 0,
+		created_at INTEGER NOT NULL,
+		PRIMARY KEY (folder_id, sender_id)
 	);
 
 	CREATE TABLE IF NOT EXISTS local_files (
@@ -147,6 +226,7 @@ func (s *Store) migrate() error {
 		is_dir INTEGER NOT NULL,
 		deleted INTEGER NOT NULL,
 		version_json TEXT NOT NULL,
+		block_size INTEGER NOT NULL DEFAULT 0,
 		blocks_json TEXT NOT NULL,
 		file_hash TEXT NOT NULL,
 		seq INTEGER NOT NULL DEFAULT 0,
@@ -165,6 +245,7 @@ func (s *Store) migrate() error {
 		is_dir INTEGER NOT NULL,
 		deleted INTEGER NOT NULL,
 		version_json TEXT NOT NULL,
+		block_size INTEGER NOT NULL DEFAULT 0,
 		blocks_json TEXT NOT NULL,
 		file_hash TEXT NOT NULL,
 		seq INTEGER NOT NULL DEFAULT 0,
@@ -177,6 +258,7 @@ func (s *Store) migrate() error {
 		folder_id TEXT NOT NULL,
 		device_id TEXT NOT NULL,
 		last_remote_seq INTEGER NOT NULL DEFAULT 0,
+		remote_index_epoch INTEGER NOT NULL DEFAULT 0,
 		PRIMARY KEY (folder_id, device_id),
 		FOREIGN KEY (folder_id) REFERENCES folders(folder_id) ON DELETE CASCADE,
 		FOREIGN KEY (device_id) REFERENCES devices(device_id) ON DELETE CASCADE
@@ -192,6 +274,7 @@ func (s *Store) migrate() error {
 		text_content TEXT NOT NULL DEFAULT '',
 		source_root TEXT NOT NULL DEFAULT '',
 		dest_dir TEXT NOT NULL DEFAULT '',
+		staging_dir TEXT NOT NULL DEFAULT '',
 		total_size INTEGER NOT NULL,
 		transferred_bytes INTEGER NOT NULL DEFAULT 0,
 		status TEXT NOT NULL,
@@ -231,16 +314,27 @@ func (s *Store) migrate() error {
 		name  string
 		def   string
 	}{
+		{"folders", "index_epoch", "INTEGER NOT NULL DEFAULT 1"},
+		{"folders", "min_free_disk_mb", "INTEGER NOT NULL DEFAULT 0"},
+		{"folders", "trashcan_max_days", "INTEGER NOT NULL DEFAULT 0"},
+		{"folders", "trashcan_max_mb", "INTEGER NOT NULL DEFAULT 0"},
 		{"local_files", "seq", "INTEGER NOT NULL DEFAULT 0"},
+		{"local_files", "block_size", "INTEGER NOT NULL DEFAULT 0"},
 		{"remote_files", "seq", "INTEGER NOT NULL DEFAULT 0"},
+		{"remote_files", "block_size", "INTEGER NOT NULL DEFAULT 0"},
+		{"peer_folder_state", "remote_index_epoch", "INTEGER NOT NULL DEFAULT 0"},
 		{"drop_transfers", "kind", "TEXT NOT NULL DEFAULT 'files'"},
 		{"drop_transfers", "text_content", "TEXT NOT NULL DEFAULT ''"},
+		{"drop_transfers", "staging_dir", "TEXT NOT NULL DEFAULT ''"},
 	} {
 		if err := s.ensureColumn(col.table, col.name, col.def); err != nil {
 			return err
 		}
 	}
-	_, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_local_files_seq ON local_files(folder_id, seq);`)
+	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_local_files_seq ON local_files(folder_id, seq);`); err != nil {
+		return err
+	}
+	_, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_remote_files_folder_peer ON remote_files(folder_id, device_id);`)
 	return err
 }
 
@@ -271,6 +365,32 @@ func (s *Store) ensureColumn(table, column, colDef string) error {
 
 // --- Devices ---
 
+func (s *Store) reloadAllowedDevices() error {
+	rows, err := s.readDB.Query(`SELECT device_id FROM devices`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	next := make(map[string]struct{})
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		norm := protocol.NormalizeDeviceID(id)
+		if norm != "" {
+			next[norm] = struct{}{}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	s.allowedMu.Lock()
+	s.allowedDevices = next
+	s.allowedMu.Unlock()
+	return nil
+}
+
 func (s *Store) UpsertDevice(d DeviceRecord) error {
 	d.DeviceID = protocol.NormalizeDeviceID(d.DeviceID)
 	if d.AddedAt == 0 {
@@ -284,6 +404,11 @@ func (s *Store) UpsertDevice(d DeviceRecord) error {
 			auto_accept_drop = excluded.auto_accept_drop,
 			last_seen = CASE WHEN excluded.last_seen > devices.last_seen THEN excluded.last_seen ELSE devices.last_seen END
 	`, d.DeviceID, d.Name, boolToInt(d.AutoAcceptDrop), d.AddedAt, d.LastSeen)
+	if err == nil && d.DeviceID != "" {
+		s.allowedMu.Lock()
+		s.allowedDevices[d.DeviceID] = struct{}{}
+		s.allowedMu.Unlock()
+	}
 	return err
 }
 
@@ -293,20 +418,47 @@ func (s *Store) TouchDeviceSeen(deviceID string) error {
 }
 
 func (s *Store) DeleteDevice(deviceID string) error {
-	_, err := s.db.Exec(`DELETE FROM devices WHERE device_id = ?`, protocol.NormalizeDeviceID(deviceID))
-	return err
+	norm := protocol.NormalizeDeviceID(deviceID)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.Exec(`DELETE FROM remote_files WHERE device_id = ?`, norm); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM folder_invitations WHERE sender_id = ?`, norm); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM devices WHERE device_id = ?`, norm); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.allowedMu.Lock()
+	delete(s.allowedDevices, norm)
+	s.allowedMu.Unlock()
+	return nil
 }
 
+// IsDeviceAllowed checks an in-memory cache so packet hot paths never touch SQLite.
 func (s *Store) IsDeviceAllowed(deviceID string) bool {
-	var count int
-	err := s.db.QueryRow(`SELECT COUNT(1) FROM devices WHERE device_id = ?`, protocol.NormalizeDeviceID(deviceID)).Scan(&count)
-	return err == nil && count > 0
+	norm := protocol.NormalizeDeviceID(deviceID)
+	if norm == "" {
+		return false
+	}
+	s.allowedMu.RLock()
+	_, ok := s.allowedDevices[norm]
+	s.allowedMu.RUnlock()
+	return ok
 }
 
 func (s *Store) GetDevice(deviceID string) (*DeviceRecord, error) {
 	var d DeviceRecord
 	var autoInt int
-	err := s.db.QueryRow(`SELECT device_id, name, auto_accept_drop, added_at, last_seen FROM devices WHERE device_id = ?`, protocol.NormalizeDeviceID(deviceID)).
+	err := s.readDB.QueryRow(`SELECT device_id, name, auto_accept_drop, added_at, last_seen FROM devices WHERE device_id = ?`, protocol.NormalizeDeviceID(deviceID)).
 		Scan(&d.DeviceID, &d.Name, &autoInt, &d.AddedAt, &d.LastSeen)
 	if err != nil {
 		return nil, err
@@ -316,7 +468,7 @@ func (s *Store) GetDevice(deviceID string) (*DeviceRecord, error) {
 }
 
 func (s *Store) ListDevices() ([]DeviceRecord, error) {
-	rows, err := s.db.Query(`SELECT device_id, name, auto_accept_drop, added_at, last_seen FROM devices ORDER BY name ASC`)
+	rows, err := s.readDB.Query(`SELECT device_id, name, auto_accept_drop, added_at, last_seen FROM devices ORDER BY name ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -350,6 +502,15 @@ func (s *Store) UpsertFolder(f FolderRecord) error {
 	if f.RescanSeconds <= 0 {
 		f.RescanSeconds = 60
 	}
+	if f.MinFreeDiskMB < 0 {
+		f.MinFreeDiskMB = 0
+	}
+	if f.TrashcanMaxDays < 0 {
+		f.TrashcanMaxDays = 0
+	}
+	if f.TrashcanMaxMB < 0 {
+		f.TrashcanMaxMB = 0
+	}
 
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -358,8 +519,8 @@ func (s *Store) UpsertFolder(f FolderRecord) error {
 	defer func() { _ = tx.Rollback() }()
 
 	_, err = tx.Exec(`
-		INSERT INTO folders (folder_id, label, local_path, mode, versioning, keep_versions, rescan_seconds, paused, ignore_patterns)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO folders (folder_id, label, local_path, mode, versioning, keep_versions, rescan_seconds, paused, ignore_patterns, min_free_disk_mb, trashcan_max_days, trashcan_max_mb)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(folder_id) DO UPDATE SET
 			label = excluded.label,
 			local_path = excluded.local_path,
@@ -368,8 +529,11 @@ func (s *Store) UpsertFolder(f FolderRecord) error {
 			keep_versions = excluded.keep_versions,
 			rescan_seconds = excluded.rescan_seconds,
 			paused = excluded.paused,
-			ignore_patterns = excluded.ignore_patterns
-	`, f.FolderID, f.Label, f.LocalPath, string(f.Mode), f.Versioning, f.KeepVersions, f.RescanSeconds, boolToInt(f.Paused), f.IgnorePatterns)
+			ignore_patterns = excluded.ignore_patterns,
+			min_free_disk_mb = excluded.min_free_disk_mb,
+			trashcan_max_days = excluded.trashcan_max_days,
+			trashcan_max_mb = excluded.trashcan_max_mb
+	`, f.FolderID, f.Label, f.LocalPath, string(f.Mode), f.Versioning, f.KeepVersions, f.RescanSeconds, boolToInt(f.Paused), f.IgnorePatterns, f.MinFreeDiskMB, f.TrashcanMaxDays, f.TrashcanMaxMB)
 	if err != nil {
 		return err
 	}
@@ -398,15 +562,19 @@ func (s *Store) GetFolder(folderID string) (*FolderRecord, error) {
 	var f FolderRecord
 	var modeStr string
 	var pausedInt int
-	err := s.db.QueryRow(`
-		SELECT folder_id, label, local_path, mode, versioning, keep_versions, rescan_seconds, paused, ignore_patterns
+	var epochInt int64
+	err := s.readDB.QueryRow(`
+		SELECT folder_id, label, local_path, mode, versioning, keep_versions, rescan_seconds, paused, ignore_patterns, index_epoch, min_free_disk_mb, trashcan_max_days, trashcan_max_mb
 		FROM folders WHERE folder_id = ?
-	`, folderID).Scan(&f.FolderID, &f.Label, &f.LocalPath, &modeStr, &f.Versioning, &f.KeepVersions, &f.RescanSeconds, &pausedInt, &f.IgnorePatterns)
+	`, folderID).Scan(&f.FolderID, &f.Label, &f.LocalPath, &modeStr, &f.Versioning, &f.KeepVersions, &f.RescanSeconds, &pausedInt, &f.IgnorePatterns, &epochInt, &f.MinFreeDiskMB, &f.TrashcanMaxDays, &f.TrashcanMaxMB)
 	if err != nil {
 		return nil, err
 	}
 	f.Mode = protocol.FolderMode(modeStr)
 	f.Paused = pausedInt != 0
+	if epochInt > 0 {
+		f.IndexEpoch = uint64(epochInt)
+	}
 	peers, err := s.getFolderPeers(f.FolderID)
 	if err != nil {
 		return nil, err
@@ -416,8 +584,8 @@ func (s *Store) GetFolder(folderID string) (*FolderRecord, error) {
 }
 
 func (s *Store) ListFolders() ([]FolderRecord, error) {
-	rows, err := s.db.Query(`
-		SELECT folder_id, label, local_path, mode, versioning, keep_versions, rescan_seconds, paused, ignore_patterns
+	rows, err := s.readDB.Query(`
+		SELECT folder_id, label, local_path, mode, versioning, keep_versions, rescan_seconds, paused, ignore_patterns, index_epoch, min_free_disk_mb, trashcan_max_days, trashcan_max_mb
 		FROM folders ORDER BY label ASC
 	`)
 	if err != nil {
@@ -430,11 +598,15 @@ func (s *Store) ListFolders() ([]FolderRecord, error) {
 		var f FolderRecord
 		var modeStr string
 		var pausedInt int
-		if err := rows.Scan(&f.FolderID, &f.Label, &f.LocalPath, &modeStr, &f.Versioning, &f.KeepVersions, &f.RescanSeconds, &pausedInt, &f.IgnorePatterns); err != nil {
+		var epochInt int64
+		if err := rows.Scan(&f.FolderID, &f.Label, &f.LocalPath, &modeStr, &f.Versioning, &f.KeepVersions, &f.RescanSeconds, &pausedInt, &f.IgnorePatterns, &epochInt, &f.MinFreeDiskMB, &f.TrashcanMaxDays, &f.TrashcanMaxMB); err != nil {
 			return nil, err
 		}
 		f.Mode = protocol.FolderMode(modeStr)
 		f.Paused = pausedInt != 0
+		if epochInt > 0 {
+			f.IndexEpoch = uint64(epochInt)
+		}
 		out = append(out, f)
 	}
 	if err := rows.Err(); err != nil {
@@ -451,7 +623,7 @@ func (s *Store) ListFolders() ([]FolderRecord, error) {
 }
 
 func (s *Store) getFolderPeers(folderID string) ([]string, error) {
-	rows, err := s.db.Query(`SELECT device_id FROM folder_peers WHERE folder_id = ? ORDER BY device_id ASC`, folderID)
+	rows, err := s.readDB.Query(`SELECT device_id FROM folder_peers WHERE folder_id = ? ORDER BY device_id ASC`, folderID)
 	if err != nil {
 		return nil, err
 	}
@@ -467,11 +639,74 @@ func (s *Store) getFolderPeers(folderID string) ([]string, error) {
 	return peers, rows.Err()
 }
 
+// --- Folder Invitations ---
+
+func (s *Store) UpsertFolderInvitation(inv FolderInvitationRecord) error {
+	inv.SenderID = protocol.NormalizeDeviceID(inv.SenderID)
+	if inv.CreatedAt == 0 {
+		inv.CreatedAt = time.Now().Unix()
+	}
+	_, err := s.db.Exec(`
+		INSERT INTO folder_invitations (folder_id, sender_id, sender_name, label, suggested_mode, file_count, total_bytes, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(folder_id, sender_id) DO UPDATE SET
+			sender_name = excluded.sender_name,
+			label = excluded.label,
+			suggested_mode = excluded.suggested_mode,
+			file_count = excluded.file_count,
+			total_bytes = excluded.total_bytes,
+			created_at = excluded.created_at
+	`, inv.FolderID, inv.SenderID, inv.SenderName, inv.Label, inv.SuggestedMode, inv.FileCount, inv.TotalBytes, inv.CreatedAt)
+	return err
+}
+
+func (s *Store) ListFolderInvitations() ([]FolderInvitationRecord, error) {
+	rows, err := s.readDB.Query(`
+		SELECT folder_id, sender_id, sender_name, label, suggested_mode, file_count, total_bytes, created_at
+		FROM folder_invitations ORDER BY created_at DESC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FolderInvitationRecord
+	for rows.Next() {
+		var inv FolderInvitationRecord
+		if err := rows.Scan(&inv.FolderID, &inv.SenderID, &inv.SenderName, &inv.Label, &inv.SuggestedMode, &inv.FileCount, &inv.TotalBytes, &inv.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, inv)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) GetFolderInvitation(folderID, senderID string) (*FolderInvitationRecord, error) {
+	var inv FolderInvitationRecord
+	err := s.readDB.QueryRow(`
+		SELECT folder_id, sender_id, sender_name, label, suggested_mode, file_count, total_bytes, created_at
+		FROM folder_invitations WHERE folder_id = ? AND sender_id = ?
+	`, folderID, protocol.NormalizeDeviceID(senderID)).
+		Scan(&inv.FolderID, &inv.SenderID, &inv.SenderName, &inv.Label, &inv.SuggestedMode, &inv.FileCount, &inv.TotalBytes, &inv.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &inv, nil
+}
+
+func (s *Store) DeleteFolderInvitation(folderID, senderID string) error {
+	if senderID == "" {
+		_, err := s.db.Exec(`DELETE FROM folder_invitations WHERE folder_id = ?`, folderID)
+		return err
+	}
+	_, err := s.db.Exec(`DELETE FROM folder_invitations WHERE folder_id = ? AND sender_id = ?`, folderID, protocol.NormalizeDeviceID(senderID))
+	return err
+}
+
 // --- File Index (Local & Remote) ---
 
 func (s *Store) GetLocalIndex(folderID string) (map[string]protocol.FileMetadata, error) {
-	rows, err := s.db.Query(`
-		SELECT rel_path, size, mtime_ns, mode_bits, is_dir, deleted, version_json, blocks_json, file_hash, seq
+	rows, err := s.readDB.Query(`
+		SELECT rel_path, size, mtime_ns, mode_bits, is_dir, deleted, version_json, block_size, blocks_json, file_hash, seq
 		FROM local_files WHERE folder_id = ?
 	`, folderID)
 	if err != nil {
@@ -483,20 +718,37 @@ func (s *Store) GetLocalIndex(folderID string) (map[string]protocol.FileMetadata
 
 // GetLocalScanIndex loads the local folder index without parsing blocks_json, dramatically reducing RAM/CPU during scans.
 func (s *Store) GetLocalScanIndex(folderID string) (map[string]protocol.FileMetadata, error) {
-	rows, err := s.db.Query(`
-		SELECT rel_path, size, mtime_ns, mode_bits, is_dir, deleted, version_json, file_hash, seq
+	rows, err := s.readDB.Query(`
+		SELECT rel_path, size, mtime_ns, mode_bits, is_dir, deleted, version_json, block_size, file_hash, seq
 		FROM local_files WHERE folder_id = ?
 	`, folderID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+	return scanScanIndexMap(rows)
+}
+
+// GetRemoteScanIndex loads a peer's remote index without parsing blocks_json to keep memory low on large folders.
+func (s *Store) GetRemoteScanIndex(folderID, deviceID string) (map[string]protocol.FileMetadata, error) {
+	rows, err := s.readDB.Query(`
+		SELECT rel_path, size, mtime_ns, mode_bits, is_dir, deleted, version_json, block_size, file_hash, seq
+		FROM remote_files WHERE folder_id = ? AND device_id = ?
+	`, folderID, protocol.NormalizeDeviceID(deviceID))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanScanIndexMap(rows)
+}
+
+func scanScanIndexMap(rows *sql.Rows) (map[string]protocol.FileMetadata, error) {
 	out := make(map[string]protocol.FileMetadata)
 	for rows.Next() {
 		var f protocol.FileMetadata
 		var isDirInt, deletedInt int
 		var vJSON string
-		if err := rows.Scan(&f.RelPath, &f.Size, &f.MtimeNs, &f.ModeBits, &isDirInt, &deletedInt, &vJSON, &f.FileHash, &f.Seq); err != nil {
+		if err := rows.Scan(&f.RelPath, &f.Size, &f.MtimeNs, &f.ModeBits, &isDirInt, &deletedInt, &vJSON, &f.BlockSize, &f.FileHash, &f.Seq); err != nil {
 			return nil, err
 		}
 		f.IsDir = isDirInt != 0
@@ -509,7 +761,7 @@ func (s *Store) GetLocalScanIndex(folderID string) (map[string]protocol.FileMeta
 
 func (s *Store) GetLocalFileBlocks(folderID, relPath string) ([]protocol.BlockInfo, error) {
 	var bJSON string
-	err := s.db.QueryRow(`SELECT blocks_json FROM local_files WHERE folder_id = ? AND rel_path = ?`, folderID, relPath).Scan(&bJSON)
+	err := s.readDB.QueryRow(`SELECT blocks_json FROM local_files WHERE folder_id = ? AND rel_path = ?`, folderID, relPath).Scan(&bJSON)
 	if err != nil {
 		return nil, err
 	}
@@ -518,6 +770,22 @@ func (s *Store) GetLocalFileBlocks(folderID, relPath string) ([]protocol.BlockIn
 	return blocks, nil
 }
 
+// GetRemoteFileBlocks lazily loads block metadata for a single remote file when needed for pulling.
+func (s *Store) GetRemoteFileBlocks(folderID, deviceID, relPath string) ([]protocol.BlockInfo, int, error) {
+	var bJSON string
+	var blockSize int
+	err := s.readDB.QueryRow(`SELECT blocks_json, block_size FROM remote_files WHERE folder_id = ? AND device_id = ? AND rel_path = ?`,
+		folderID, protocol.NormalizeDeviceID(deviceID), relPath).Scan(&bJSON, &blockSize)
+	if err != nil {
+		return nil, 0, err
+	}
+	var blocks []protocol.BlockInfo
+	_ = json.Unmarshal([]byte(bJSON), &blocks)
+	return blocks, blockSize, nil
+}
+
+// DeleteLocalFiles removes ignored entries from local_files and bumps the folder's index_epoch
+// so peers detect structural purges cleanly and perform a fresh index sync.
 func (s *Store) DeleteLocalFiles(folderID string, relPaths []string) error {
 	if len(relPaths) == 0 {
 		return nil
@@ -531,23 +799,41 @@ func (s *Store) DeleteLocalFiles(folderID string, relPaths []string) error {
 	if err != nil {
 		return err
 	}
-	defer stmt.Close()
 	for _, rel := range relPaths {
 		if _, err := stmt.Exec(folderID, rel); err != nil {
+			_ = stmt.Close()
 			return err
 		}
+	}
+	_ = stmt.Close()
+
+	if _, err := tx.Exec(`UPDATE folders SET index_epoch = index_epoch + 1 WHERE folder_id = ?`, folderID); err != nil {
+		return err
 	}
 	return tx.Commit()
 }
 
 func (s *Store) GetLocalIndexSummary(folderID string) (maxSeq int64, count int, err error) {
-	err = s.db.QueryRow(`SELECT COALESCE(MAX(seq), 0), COUNT(1) FROM local_files WHERE folder_id = ?`, folderID).Scan(&maxSeq, &count)
+	err = s.readDB.QueryRow(`SELECT COALESCE(MAX(seq), 0), COUNT(1) FROM local_files WHERE folder_id = ?`, folderID).Scan(&maxSeq, &count)
 	return maxSeq, count, err
 }
 
+func (s *Store) GetLocalIndexSummaryWithEpoch(folderID string) (maxSeq int64, count int, epoch uint64, err error) {
+	var ep int64
+	err = s.readDB.QueryRow(`
+		SELECT COALESCE((SELECT MAX(seq) FROM local_files WHERE folder_id = ?), 0),
+		       COALESCE((SELECT COUNT(1) FROM local_files WHERE folder_id = ?), 0),
+		       COALESCE((SELECT index_epoch FROM folders WHERE folder_id = ?), 1)
+	`, folderID, folderID, folderID).Scan(&maxSeq, &count, &ep)
+	if ep > 0 {
+		epoch = uint64(ep)
+	}
+	return maxSeq, count, epoch, err
+}
+
 func (s *Store) GetLocalIndexSince(folderID string, sinceSeq int64) ([]protocol.FileMetadata, error) {
-	rows, err := s.db.Query(`
-		SELECT rel_path, size, mtime_ns, mode_bits, is_dir, deleted, version_json, blocks_json, file_hash, seq
+	rows, err := s.readDB.Query(`
+		SELECT rel_path, size, mtime_ns, mode_bits, is_dir, deleted, version_json, block_size, blocks_json, file_hash, seq
 		FROM local_files WHERE folder_id = ? AND seq > ? ORDER BY seq ASC
 	`, folderID, sinceSeq)
 	if err != nil {
@@ -559,9 +845,23 @@ func (s *Store) GetLocalIndexSince(folderID string, sinceSeq int64) ([]protocol.
 
 func (s *Store) GetPeerRemoteMaxSeq(folderID, deviceID string) (int64, error) {
 	var seq int64
-	err := s.db.QueryRow(`SELECT COALESCE(MAX(seq), 0) FROM remote_files WHERE folder_id = ? AND device_id = ?`,
+	err := s.readDB.QueryRow(`SELECT COALESCE(MAX(seq), 0) FROM remote_files WHERE folder_id = ? AND device_id = ?`,
 		folderID, protocol.NormalizeDeviceID(deviceID)).Scan(&seq)
 	return seq, err
+}
+
+func (s *Store) GetPeerRemoteSummary(folderID, deviceID string) (maxSeq int64, count int, epoch uint64, err error) {
+	norm := protocol.NormalizeDeviceID(deviceID)
+	var ep int64
+	err = s.readDB.QueryRow(`
+		SELECT COALESCE((SELECT MAX(seq) FROM remote_files WHERE folder_id = ? AND device_id = ?), 0),
+		       COALESCE((SELECT COUNT(1) FROM remote_files WHERE folder_id = ? AND device_id = ?), 0),
+		       COALESCE((SELECT remote_index_epoch FROM peer_folder_state WHERE folder_id = ? AND device_id = ?), 0)
+	`, folderID, norm, folderID, norm, folderID, norm).Scan(&maxSeq, &count, &ep)
+	if ep > 0 {
+		epoch = uint64(ep)
+	}
+	return maxSeq, count, epoch, err
 }
 
 func (s *Store) UpsertLocalFiles(folderID string, files []protocol.FileMetadata) error {
@@ -580,8 +880,8 @@ func (s *Store) UpsertLocalFiles(folderID string, files []protocol.FileMetadata)
 	}
 
 	stmt, err := tx.Prepare(`
-		INSERT INTO local_files (folder_id, rel_path, size, mtime_ns, mode_bits, is_dir, deleted, version_json, blocks_json, file_hash, seq, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO local_files (folder_id, rel_path, size, mtime_ns, mode_bits, is_dir, deleted, version_json, block_size, blocks_json, file_hash, seq, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(folder_id, rel_path) DO UPDATE SET
 			size = excluded.size,
 			mtime_ns = excluded.mtime_ns,
@@ -589,6 +889,7 @@ func (s *Store) UpsertLocalFiles(folderID string, files []protocol.FileMetadata)
 			is_dir = excluded.is_dir,
 			deleted = excluded.deleted,
 			version_json = excluded.version_json,
+			block_size = excluded.block_size,
 			blocks_json = excluded.blocks_json,
 			file_hash = excluded.file_hash,
 			seq = excluded.seq,
@@ -606,7 +907,7 @@ func (s *Store) UpsertLocalFiles(folderID string, files []protocol.FileMetadata)
 		f := files[i]
 		vJSON, _ := json.Marshal(f.Version)
 		bJSON, _ := json.Marshal(f.Blocks)
-		if _, err := stmt.Exec(folderID, f.RelPath, f.Size, f.MtimeNs, f.ModeBits, boolToInt(f.IsDir), boolToInt(f.Deleted), string(vJSON), string(bJSON), f.FileHash, f.Seq, now); err != nil {
+		if _, err := stmt.Exec(folderID, f.RelPath, f.Size, f.MtimeNs, f.ModeBits, boolToInt(f.IsDir), boolToInt(f.Deleted), string(vJSON), f.BlockSize, string(bJSON), f.FileHash, f.Seq, now); err != nil {
 			return err
 		}
 	}
@@ -614,8 +915,8 @@ func (s *Store) UpsertLocalFiles(folderID string, files []protocol.FileMetadata)
 }
 
 func (s *Store) GetRemoteIndex(folderID, deviceID string) (map[string]protocol.FileMetadata, error) {
-	rows, err := s.db.Query(`
-		SELECT rel_path, size, mtime_ns, mode_bits, is_dir, deleted, version_json, blocks_json, file_hash, seq
+	rows, err := s.readDB.Query(`
+		SELECT rel_path, size, mtime_ns, mode_bits, is_dir, deleted, version_json, block_size, blocks_json, file_hash, seq
 		FROM remote_files WHERE folder_id = ? AND device_id = ?
 	`, folderID, protocol.NormalizeDeviceID(deviceID))
 	if err != nil {
@@ -626,6 +927,10 @@ func (s *Store) GetRemoteIndex(folderID, deviceID string) (map[string]protocol.F
 }
 
 func (s *Store) UpsertRemoteFiles(folderID, deviceID string, full bool, files []protocol.FileMetadata) error {
+	return s.UpsertRemoteFilesWithEpoch(folderID, deviceID, full, 0, files)
+}
+
+func (s *Store) UpsertRemoteFilesWithEpoch(folderID, deviceID string, full bool, epoch uint64, files []protocol.FileMetadata) error {
 	deviceID = protocol.NormalizeDeviceID(deviceID)
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -640,8 +945,8 @@ func (s *Store) UpsertRemoteFiles(folderID, deviceID string, full bool, files []
 	}
 
 	stmt, err := tx.Prepare(`
-		INSERT INTO remote_files (folder_id, device_id, rel_path, size, mtime_ns, mode_bits, is_dir, deleted, version_json, blocks_json, file_hash, seq, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO remote_files (folder_id, device_id, rel_path, size, mtime_ns, mode_bits, is_dir, deleted, version_json, block_size, blocks_json, file_hash, seq, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(folder_id, device_id, rel_path) DO UPDATE SET
 			size = excluded.size,
 			mtime_ns = excluded.mtime_ns,
@@ -649,6 +954,7 @@ func (s *Store) UpsertRemoteFiles(folderID, deviceID string, full bool, files []
 			is_dir = excluded.is_dir,
 			deleted = excluded.deleted,
 			version_json = excluded.version_json,
+			block_size = excluded.block_size,
 			blocks_json = excluded.blocks_json,
 			file_hash = excluded.file_hash,
 			seq = excluded.seq,
@@ -660,12 +966,26 @@ func (s *Store) UpsertRemoteFiles(folderID, deviceID string, full bool, files []
 	defer stmt.Close()
 
 	now := time.Now().Unix()
+	var maxSeq int64
 	for _, f := range files {
+		if f.Seq > maxSeq {
+			maxSeq = f.Seq
+		}
 		vJSON, _ := json.Marshal(f.Version)
 		bJSON, _ := json.Marshal(f.Blocks)
-		if _, err := stmt.Exec(folderID, deviceID, f.RelPath, f.Size, f.MtimeNs, f.ModeBits, boolToInt(f.IsDir), boolToInt(f.Deleted), string(vJSON), string(bJSON), f.FileHash, f.Seq, now); err != nil {
+		if _, err := stmt.Exec(folderID, deviceID, f.RelPath, f.Size, f.MtimeNs, f.ModeBits, boolToInt(f.IsDir), boolToInt(f.Deleted), string(vJSON), f.BlockSize, string(bJSON), f.FileHash, f.Seq, now); err != nil {
 			return err
 		}
+	}
+	if epoch > 0 {
+		// Record remote epoch if device is paired (ignore FK error if device isn't inserted in isolated unit tests)
+		_, _ = tx.Exec(`
+			INSERT INTO peer_folder_state (folder_id, device_id, last_remote_seq, remote_index_epoch)
+			VALUES (?, ?, ?, ?)
+			ON CONFLICT(folder_id, device_id) DO UPDATE SET
+				last_remote_seq = MAX(peer_folder_state.last_remote_seq, excluded.last_remote_seq),
+				remote_index_epoch = excluded.remote_index_epoch
+		`, folderID, deviceID, maxSeq, int64(epoch))
 	}
 	return tx.Commit()
 }
@@ -676,7 +996,7 @@ func scanFileMap(rows *sql.Rows) (map[string]protocol.FileMetadata, error) {
 		var f protocol.FileMetadata
 		var isDirInt, deletedInt int
 		var vJSON, bJSON string
-		if err := rows.Scan(&f.RelPath, &f.Size, &f.MtimeNs, &f.ModeBits, &isDirInt, &deletedInt, &vJSON, &bJSON, &f.FileHash, &f.Seq); err != nil {
+		if err := rows.Scan(&f.RelPath, &f.Size, &f.MtimeNs, &f.ModeBits, &isDirInt, &deletedInt, &vJSON, &f.BlockSize, &bJSON, &f.FileHash, &f.Seq); err != nil {
 			return nil, err
 		}
 		f.IsDir = isDirInt != 0
@@ -694,7 +1014,7 @@ func scanFileSlice(rows *sql.Rows) ([]protocol.FileMetadata, error) {
 		var f protocol.FileMetadata
 		var isDirInt, deletedInt int
 		var vJSON, bJSON string
-		if err := rows.Scan(&f.RelPath, &f.Size, &f.MtimeNs, &f.ModeBits, &isDirInt, &deletedInt, &vJSON, &bJSON, &f.FileHash, &f.Seq); err != nil {
+		if err := rows.Scan(&f.RelPath, &f.Size, &f.MtimeNs, &f.ModeBits, &isDirInt, &deletedInt, &vJSON, &f.BlockSize, &bJSON, &f.FileHash, &f.Seq); err != nil {
 			return nil, err
 		}
 		f.IsDir = isDirInt != 0
@@ -729,15 +1049,19 @@ func (s *Store) UpsertDropTransfer(t DropTransferRecord) error {
 	defer func() { _ = tx.Rollback() }()
 
 	_, err = tx.Exec(`
-		INSERT INTO drop_transfers (transfer_id, direction, kind, peer_id, peer_name, title, text_content, source_root, dest_dir, total_size, transferred_bytes, status, files_json, completed_blocks_json, error_msg, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, ?)
+		INSERT INTO drop_transfers (transfer_id, direction, kind, peer_id, peer_name, title, text_content, source_root, dest_dir, staging_dir, total_size, transferred_bytes, status, files_json, completed_blocks_json, error_msg, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, ?)
 		ON CONFLICT(transfer_id) DO UPDATE SET
+			source_root = CASE WHEN excluded.source_root != '' THEN excluded.source_root ELSE drop_transfers.source_root END,
 			dest_dir = excluded.dest_dir,
+			staging_dir = CASE WHEN excluded.staging_dir != '' THEN excluded.staging_dir ELSE drop_transfers.staging_dir END,
+			total_size = CASE WHEN excluded.total_size > 0 THEN excluded.total_size ELSE drop_transfers.total_size END,
 			transferred_bytes = excluded.transferred_bytes,
 			status = excluded.status,
+			files_json = CASE WHEN excluded.files_json != 'null' AND excluded.files_json != '[]' THEN excluded.files_json ELSE drop_transfers.files_json END,
 			error_msg = excluded.error_msg,
 			updated_at = excluded.updated_at
-	`, t.TransferID, t.Direction, t.Kind, protocol.NormalizeDeviceID(t.PeerID), t.PeerName, t.Title, t.TextContent, t.SourceRoot, t.DestDir, t.TotalSize, t.TransferredBytes, t.Status, string(filesJSON), t.ErrorMsg, t.CreatedAt, t.UpdatedAt)
+	`, t.TransferID, t.Direction, t.Kind, protocol.NormalizeDeviceID(t.PeerID), t.PeerName, t.Title, t.TextContent, t.SourceRoot, t.DestDir, t.StagingDir, t.TotalSize, t.TransferredBytes, t.Status, string(filesJSON), t.ErrorMsg, t.CreatedAt, t.UpdatedAt)
 	if err != nil {
 		return err
 	}
@@ -762,10 +1086,10 @@ func (s *Store) UpsertDropTransfer(t DropTransferRecord) error {
 func (s *Store) GetDropTransfer(transferID string) (*DropTransferRecord, error) {
 	var t DropTransferRecord
 	var filesJSON, blocksJSON string
-	err := s.db.QueryRow(`
-		SELECT transfer_id, direction, kind, peer_id, peer_name, title, text_content, source_root, dest_dir, total_size, transferred_bytes, status, files_json, completed_blocks_json, error_msg, created_at, updated_at
+	err := s.readDB.QueryRow(`
+		SELECT transfer_id, direction, kind, peer_id, peer_name, title, text_content, source_root, dest_dir, staging_dir, total_size, transferred_bytes, status, files_json, completed_blocks_json, error_msg, created_at, updated_at
 		FROM drop_transfers WHERE transfer_id = ?
-	`, transferID).Scan(&t.TransferID, &t.Direction, &t.Kind, &t.PeerID, &t.PeerName, &t.Title, &t.TextContent, &t.SourceRoot, &t.DestDir, &t.TotalSize, &t.TransferredBytes, &t.Status, &filesJSON, &blocksJSON, &t.ErrorMsg, &t.CreatedAt, &t.UpdatedAt)
+	`, transferID).Scan(&t.TransferID, &t.Direction, &t.Kind, &t.PeerID, &t.PeerName, &t.Title, &t.TextContent, &t.SourceRoot, &t.DestDir, &t.StagingDir, &t.TotalSize, &t.TransferredBytes, &t.Status, &filesJSON, &blocksJSON, &t.ErrorMsg, &t.CreatedAt, &t.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -783,7 +1107,7 @@ func (s *Store) GetDropTransfer(transferID string) (*DropTransferRecord, error) 
 }
 
 func (s *Store) GetDropCompletedBlocks(transferID string) (map[string][]int, error) {
-	rows, err := s.db.Query(`SELECT rel_path, block_idx FROM drop_completed_blocks WHERE transfer_id = ?`, transferID)
+	rows, err := s.readDB.Query(`SELECT rel_path, block_idx FROM drop_completed_blocks WHERE transfer_id = ?`, transferID)
 	if err != nil {
 		return nil, err
 	}
@@ -800,6 +1124,11 @@ func (s *Store) GetDropCompletedBlocks(transferID string) (map[string][]int, err
 	return out, rows.Err()
 }
 
+func (s *Store) PruneCompletedDropBlocks(transferID string) error {
+	_, err := s.db.Exec(`DELETE FROM drop_completed_blocks WHERE transfer_id = ?`, transferID)
+	return err
+}
+
 type DropBlockCompletion struct {
 	RelPath  string
 	BlockIdx int
@@ -810,7 +1139,7 @@ type DropBlockCompletion struct {
 func (s *Store) MarkDropBlocksCompleted(transferID string, items []DropBlockCompletion) (int64, error) {
 	if len(items) == 0 {
 		var cur int64
-		_ = s.db.QueryRow(`SELECT transferred_bytes FROM drop_transfers WHERE transfer_id = ?`, transferID).Scan(&cur)
+		_ = s.readDB.QueryRow(`SELECT transferred_bytes FROM drop_transfers WHERE transfer_id = ?`, transferID).Scan(&cur)
 		return cur, nil
 	}
 	tx, err := s.db.Begin()
@@ -852,8 +1181,8 @@ func (s *Store) MarkDropBlocksCompleted(transferID string, items []DropBlockComp
 }
 
 func (s *Store) ListDropTransfers() ([]DropTransferRecord, error) {
-	rows, err := s.db.Query(`
-		SELECT transfer_id, direction, kind, peer_id, peer_name, title, text_content, source_root, dest_dir, total_size, transferred_bytes, status, files_json, completed_blocks_json, error_msg, created_at, updated_at
+	rows, err := s.readDB.Query(`
+		SELECT transfer_id, direction, kind, peer_id, peer_name, title, text_content, source_root, dest_dir, staging_dir, total_size, transferred_bytes, status, files_json, completed_blocks_json, error_msg, created_at, updated_at
 		FROM drop_transfers ORDER BY created_at DESC LIMIT 100
 	`)
 	if err != nil {
@@ -865,7 +1194,7 @@ func (s *Store) ListDropTransfers() ([]DropTransferRecord, error) {
 	for rows.Next() {
 		var t DropTransferRecord
 		var filesJSON, blocksJSON string
-		if err := rows.Scan(&t.TransferID, &t.Direction, &t.Kind, &t.PeerID, &t.PeerName, &t.Title, &t.TextContent, &t.SourceRoot, &t.DestDir, &t.TotalSize, &t.TransferredBytes, &t.Status, &filesJSON, &blocksJSON, &t.ErrorMsg, &t.CreatedAt, &t.UpdatedAt); err != nil {
+		if err := rows.Scan(&t.TransferID, &t.Direction, &t.Kind, &t.PeerID, &t.PeerName, &t.Title, &t.TextContent, &t.SourceRoot, &t.DestDir, &t.StagingDir, &t.TotalSize, &t.TransferredBytes, &t.Status, &filesJSON, &blocksJSON, &t.ErrorMsg, &t.CreatedAt, &t.UpdatedAt); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(filesJSON), &t.Files)
@@ -880,8 +1209,8 @@ func (s *Store) ListDropTransfers() ([]DropTransferRecord, error) {
 
 // ListDropTransfersSummary returns lightweight transfer records without files_json or completed_blocks_json.
 func (s *Store) ListDropTransfersSummary() ([]DropTransferRecord, error) {
-	rows, err := s.db.Query(`
-		SELECT transfer_id, direction, kind, peer_id, peer_name, title, text_content, dest_dir, total_size, transferred_bytes, status, error_msg, created_at, updated_at
+	rows, err := s.readDB.Query(`
+		SELECT transfer_id, direction, kind, peer_id, peer_name, title, text_content, dest_dir, staging_dir, total_size, transferred_bytes, status, error_msg, created_at, updated_at
 		FROM drop_transfers ORDER BY created_at DESC LIMIT 100
 	`)
 	if err != nil {
@@ -892,7 +1221,7 @@ func (s *Store) ListDropTransfersSummary() ([]DropTransferRecord, error) {
 	var out []DropTransferRecord
 	for rows.Next() {
 		var t DropTransferRecord
-		if err := rows.Scan(&t.TransferID, &t.Direction, &t.Kind, &t.PeerID, &t.PeerName, &t.Title, &t.TextContent, &t.DestDir, &t.TotalSize, &t.TransferredBytes, &t.Status, &t.ErrorMsg, &t.CreatedAt, &t.UpdatedAt); err != nil {
+		if err := rows.Scan(&t.TransferID, &t.Direction, &t.Kind, &t.PeerID, &t.PeerName, &t.Title, &t.TextContent, &t.DestDir, &t.StagingDir, &t.TotalSize, &t.TransferredBytes, &t.Status, &t.ErrorMsg, &t.CreatedAt, &t.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, t)
@@ -901,7 +1230,7 @@ func (s *Store) ListDropTransfersSummary() ([]DropTransferRecord, error) {
 }
 
 func (s *Store) ListActiveDropTransferIDs() (map[string]struct{}, error) {
-	rows, err := s.db.Query(`SELECT transfer_id FROM drop_transfers WHERE status IN ('pending_accept', 'transferring', 'paused')`)
+	rows, err := s.readDB.Query(`SELECT transfer_id FROM drop_transfers WHERE status IN ('preparing', 'queued_offline', 'pending_accept', 'transferring', 'paused')`)
 	if err != nil {
 		return nil, err
 	}
@@ -917,10 +1246,50 @@ func (s *Store) ListActiveDropTransferIDs() (map[string]struct{}, error) {
 	return out, rows.Err()
 }
 
+func (s *Store) ListActiveDropStagingDirs() (map[string]struct{}, error) {
+	rows, err := s.readDB.Query(`SELECT staging_dir FROM drop_transfers WHERE staging_dir != '' AND status IN ('preparing', 'queued_offline', 'pending_accept', 'transferring', 'paused')`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]struct{})
+	for rows.Next() {
+		var dir string
+		if err := rows.Scan(&dir); err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(dir) != "" {
+			out[filepath.Clean(dir)] = struct{}{}
+		}
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) ListResumableSendDropIDs(peerID string) ([]string, error) {
-	rows, err := s.db.Query(`
+	rows, err := s.readDB.Query(`
 		SELECT transfer_id FROM drop_transfers
 		WHERE direction = 'send' AND peer_id = ? AND status = 'transferring'
+		ORDER BY created_at ASC
+	`, protocol.NormalizeDeviceID(peerID))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+func (s *Store) ListQueuedOfflineSendDropIDs(peerID string) ([]string, error) {
+	rows, err := s.readDB.Query(`
+		SELECT transfer_id FROM drop_transfers
+		WHERE direction = 'send' AND peer_id = ? AND status = 'queued_offline'
 		ORDER BY created_at ASC
 	`, protocol.NormalizeDeviceID(peerID))
 	if err != nil {
@@ -941,6 +1310,11 @@ func (s *Store) ListResumableSendDropIDs(peerID string) ([]string, error) {
 func (s *Store) UpdateDropStatusOnly(transferID, status, errorMsg string) error {
 	_, err := s.db.Exec(`UPDATE drop_transfers SET status = ?, error_msg = ?, updated_at = ? WHERE transfer_id = ?`,
 		status, errorMsg, time.Now().Unix(), transferID)
+	return err
+}
+
+func (s *Store) ClearDropStagingDir(transferID string) error {
+	_, err := s.db.Exec(`UPDATE drop_transfers SET staging_dir = '' WHERE transfer_id = ?`, transferID)
 	return err
 }
 
@@ -1017,7 +1391,7 @@ func (s *Store) DeleteDropTransfer(transferID string) error {
 
 func (s *Store) GetDropTransferStatus(transferID string) (string, error) {
 	var status string
-	err := s.db.QueryRow(`SELECT status FROM drop_transfers WHERE transfer_id = ?`, transferID).Scan(&status)
+	err := s.readDB.QueryRow(`SELECT status FROM drop_transfers WHERE transfer_id = ?`, transferID).Scan(&status)
 	return status, err
 }
 
@@ -1060,7 +1434,7 @@ func (s *Store) UpsertPairRequest(r PairRequestRecord) error {
 func (s *Store) GetPairRequest(deviceID string) (*PairRequestRecord, error) {
 	var r PairRequestRecord
 	var lanJSON string
-	err := s.db.QueryRow(`
+	err := s.readDB.QueryRow(`
 		SELECT device_id, direction, name, message, endpoint, lan_addrs_json, observed_addr, created_at
 		FROM pair_requests WHERE device_id = ?
 	`, protocol.NormalizeDeviceID(deviceID)).Scan(&r.DeviceID, &r.Direction, &r.Name, &r.Message, &r.Endpoint, &lanJSON, &r.ObservedAddr, &r.CreatedAt)
@@ -1077,7 +1451,7 @@ func (s *Store) DeletePairRequest(deviceID string) error {
 }
 
 func (s *Store) ListPairRequests() ([]PairRequestRecord, error) {
-	rows, err := s.db.Query(`
+	rows, err := s.readDB.Query(`
 		SELECT device_id, direction, name, message, endpoint, lan_addrs_json, observed_addr, created_at
 		FROM pair_requests ORDER BY created_at DESC
 	`)

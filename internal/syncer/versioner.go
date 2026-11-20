@@ -88,6 +88,76 @@ func ArchiveSourceFile(folderRoot, relPath, src, policy string, keepVersions int
 	}
 }
 
+// PruneTrashcan enforces age (maxDays) and total size (maxMB) quotas on .gensversions/.
+func PruneTrashcan(folderRoot string, maxDays int, maxMB int) {
+	if maxDays <= 0 && maxMB <= 0 {
+		return
+	}
+	vRoot := filepath.Join(folderRoot, ".gensversions")
+	if _, err := os.Stat(vRoot); os.IsNotExist(err) {
+		return
+	}
+
+	type archivedFile struct {
+		path    string
+		size    int64
+		modTime time.Time
+	}
+	var kept []archivedFile
+	var totalBytes int64
+	var cutoff time.Time
+	if maxDays > 0 {
+		cutoff = time.Now().Add(-time.Duration(maxDays) * 24 * time.Hour)
+	}
+
+	_ = filepath.WalkDir(vRoot, func(p string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		if maxDays > 0 && info.ModTime().Before(cutoff) {
+			_ = os.Remove(p)
+			return nil
+		}
+		sz := info.Size()
+		totalBytes += sz
+		kept = append(kept, archivedFile{path: p, size: sz, modTime: info.ModTime()})
+		return nil
+	})
+
+	if maxMB > 0 {
+		limitBytes := int64(maxMB) * 1024 * 1024
+		if totalBytes > limitBytes {
+			sort.Slice(kept, func(i, j int) bool {
+				return kept[i].modTime.Before(kept[j].modTime)
+			})
+			for _, f := range kept {
+				if totalBytes <= limitBytes {
+					break
+				}
+				if err := os.Remove(f.path); err == nil {
+					totalBytes -= f.size
+				}
+			}
+		}
+	}
+
+	// Prune empty subdirectories inside .gensversions
+	var dirs []string
+	_ = filepath.WalkDir(vRoot, func(p string, d os.DirEntry, walkErr error) error {
+		if walkErr == nil && d.IsDir() && p != vRoot {
+			dirs = append(dirs, p)
+		}
+		return nil
+	})
+	for i := len(dirs) - 1; i >= 0; i-- {
+		_ = os.Remove(dirs[i]) // succeeds only if empty
+	}
+}
+
 func collectVersionMatches(dir, stem, ext string) []os.DirEntry {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -123,7 +193,6 @@ func pruneStaggeredVersions(dir, stem, ext string) {
 	}
 	now := time.Now().UTC()
 	keptBuckets := make(map[string]bool)
-	// Iterate newest to oldest so we always keep the latest version in each time bucket
 	for i := len(matches) - 1; i >= 0; i-- {
 		info, err := matches[i].Info()
 		if err != nil {
@@ -137,7 +206,6 @@ func pruneStaggeredVersions(dir, stem, ext string) {
 		var bucket string
 		switch {
 		case age <= time.Hour:
-			// Keep all versions within the last hour (per-minute bucket max 1/sec already distinct)
 			bucket = fmt.Sprintf("m-%d", i)
 		case age <= 24*time.Hour:
 			bucket = "h-" + info.ModTime().UTC().Format("2006010215")

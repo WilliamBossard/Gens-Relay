@@ -12,14 +12,21 @@ RUN go mod download
 COPY . .
 COPY --from=webbuild /app/web/dist ./web/dist
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /gens-daemon ./cmd/gens-daemon
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /gens-drop ./cmd/gens-drop
 
 FROM alpine:3.21
-RUN apk add --no-cache ca-certificates tzdata wget
+RUN apk add --no-cache ca-certificates tzdata wget \
+ && addgroup -g 1000 -S gens \
+ && adduser -u 1000 -S -G gens -h /config gens \
+ && mkdir -p /config /data/inbox \
+ && chown -R 1000:1000 /config /data
 COPY --from=gobuild /gens-daemon /usr/local/bin/gens-daemon
+COPY --from=gobuild /gens-drop /usr/local/bin/gens-drop
 ENV GENS_DATA_DIR=/config
 ENV GENS_WEB_LISTEN=0.0.0.0:8385
 ENV GENS_DROP_INBOX=/data/inbox
+USER 1000:1000
 VOLUME ["/config", "/data"]
 EXPOSE 8385/tcp 22000/udp 21027/udp
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD wget -qO- http://127.0.0.1:8385/api/v1/status >/dev/null || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD wget -qO- http://127.0.0.1:8385/api/v1/setup/status >/dev/null || exit 1
 ENTRYPOINT ["/usr/local/bin/gens-daemon"]

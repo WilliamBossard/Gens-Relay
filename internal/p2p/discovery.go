@@ -73,13 +73,14 @@ type NearbyPeer struct {
 	LastSeen int64  `json:"last_seen"`
 }
 
-// LocalLANAddrs returns non-loopback IPv4 interface addresses formatted as ip:quicPort.
+// LocalLANAddrs returns non-loopback IPv4 and global/ULA IPv6 interface addresses formatted as ip:quicPort.
 func LocalLANAddrs(quicPort int) []string {
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return nil
 	}
-	var out []string
+	var v4Out []string
+	var v6Out []string
 	for _, iface := range ifaces {
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
 			continue
@@ -93,18 +94,28 @@ func LocalLANAddrs(quicPort int) []string {
 			if !ok {
 				continue
 			}
-			ip4 := ipNet.IP.To4()
-			if ip4 == nil || ip4.IsLoopback() || ip4.IsLinkLocalUnicast() {
+			ip := ipNet.IP
+			if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() {
 				continue
 			}
-			if quicPort > 0 {
-				out = append(out, net.JoinHostPort(ip4.String(), itoa(quicPort)))
-			} else {
-				out = append(out, ip4.String())
+			if ip4 := ip.To4(); ip4 != nil {
+				if quicPort > 0 {
+					v4Out = append(v4Out, net.JoinHostPort(ip4.String(), itoa(quicPort)))
+				} else {
+					v4Out = append(v4Out, ip4.String())
+				}
+				continue
+			}
+			if ip.IsGlobalUnicast() || ip.IsPrivate() {
+				if quicPort > 0 {
+					v6Out = append(v6Out, net.JoinHostPort(ip.String(), itoa(quicPort)))
+				} else {
+					v6Out = append(v6Out, ip.String())
+				}
 			}
 		}
 	}
-	return out
+	return append(v4Out, v6Out...)
 }
 
 func (m *Manager) NearbyPeers() []NearbyPeer {

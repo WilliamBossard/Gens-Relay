@@ -1,11 +1,11 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ClipboardCopy, FolderOpen, MessageSquare, Trash2, UploadCloud, X } from "lucide-react";
 import { apiFetch, collectDroppedItems } from "../api";
 import { DaemonStatus, DropTransfer, PeerStatus, StagedBrowserFile, formatBytes } from "../types";
 
 type Props = {
   status: DaemonStatus | null;
-  connectedPeers: PeerStatus[];
+  peerStatuses: PeerStatus[];
   transfers: DropTransfer[];
   dropSpeedMap: Record<string, number>;
   dropPaths: string[];
@@ -15,9 +15,21 @@ type Props = {
   notify: (text: string, kind?: "ok" | "err") => void;
 };
 
+const DROP_STATUS_LABEL: Record<string, string> = {
+  preparing: "Préparation...",
+  queued_offline: "En attente du pair",
+  pending_accept: "En attente d'acceptation",
+  transferring: "En cours",
+  paused: "En pause",
+  completed: "Terminé",
+  rejected: "Refusé",
+  canceled: "Annulé",
+  failed: "Échoué",
+};
+
 export function DropTab({
   status,
-  connectedPeers,
+  peerStatuses,
   transfers,
   dropSpeedMap,
   dropPaths,
@@ -36,10 +48,49 @@ export function DropTab({
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const folderInputRef = useRef<HTMLInputElement | null>(null);
 
+  const onlinePeers = peerStatuses.filter((p) => p.connected);
+  const offlinePeers = peerStatuses.filter((p) => !p.connected);
+
+  useEffect(() => {
+    const onPaste = (e: ClipboardEvent) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      const pastedImages: StagedBrowserFile[] = [];
+      for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        if (it.kind === "file") {
+          const f = it.getAsFile();
+          if (f) {
+            const ext = f.type.split("/")[1] || "bin";
+            const name = f.name && f.name !== "image.png" ? f.name : `clipboard-${Date.now()}-${i}.${ext}`;
+            pastedImages.push({ file: f, relPath: name });
+          }
+        }
+      }
+      if (pastedImages.length > 0) {
+        e.preventDefault();
+        setBrowserFiles((prev) => [...prev, ...pastedImages]);
+        notify(`${pastedImages.length} élément(s) collé(s) depuis le presse-papiers.`);
+        return;
+      }
+      const tag = (document.activeElement?.tagName || "").toUpperCase();
+      if (tag !== "INPUT" && tag !== "TEXTAREA") {
+        const txt = e.clipboardData?.getData("text/plain") || "";
+        if (txt.trim()) {
+          e.preventDefault();
+          setTextSnippet((prev) => (prev ? `${prev}\n${txt}` : txt));
+          notify("Texte collé dans l'envoi rapide.");
+        }
+      }
+    };
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  }, [notify]);
+
   const sendDrop = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!dropPeer) {
-      notify("Sélectionne un appareil destinataire en ligne.", "err");
+      notify("Sélectionne un appareil destinataire.", "err");
       return;
     }
 
@@ -52,7 +103,7 @@ export function DropTab({
     }
 
     if (browserFiles.length === 0 && hostPaths.length === 0 && !textSnippet.trim()) {
-      notify("Dépose des fichiers, saisis du texte ou sélectionne un chemin.", "err");
+      notify("Dépose des fichiers, colle (Ctrl+V) ou sélectionne un chemin.", "err");
       return;
     }
 
@@ -118,12 +169,23 @@ export function DropTab({
     }
   };
 
+  const openDestDir = async (dir: string) => {
+    try {
+      await apiFetch("/api/v1/open-path", {
+        method: "POST",
+        body: JSON.stringify({ path: dir, reveal: false }),
+      });
+    } catch (e: any) {
+      notify(e?.message || "Impossible d'ouvrir le dossier.", "err");
+    }
+  };
+
   return (
     <div className="space-y-5">
       <div>
         <h2 className="text-lg font-semibold text-zinc-100">QuickDrop</h2>
         <p className="text-xs text-zinc-400 mt-0.5">
-          Envoie des fichiers, dossiers ou messages texte directement à un appareil connecté en P2P.
+          Envoie des fichiers, dossiers ou presse-papiers (Ctrl+V) en P2P, avec mise en file d'attente hors-ligne automatique.
         </p>
       </div>
 
@@ -136,20 +198,32 @@ export function DropTab({
               onChange={(e) => setDropPeer(e.target.value)}
               className="w-full bg-[#0b0d11] border border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-blue-500"
             >
-              <option value="">-- Sélectionner un appareil en ligne --</option>
-              {connectedPeers.map((p) => (
-                <option key={p.device_id} value={p.device_id}>
-                  {p.name || p.device_id} ({p.route.toUpperCase()})
-                </option>
-              ))}
+              <option value="">-- Sélectionner un appareil --</option>
+              {onlinePeers.length > 0 && (
+                <optgroup label="En ligne">
+                  {onlinePeers.map((p) => (
+                    <option key={p.device_id} value={p.device_id}>
+                      {p.name || p.device_id} ({(p.route || "p2p").toUpperCase()})
+                    </option>
+                  ))}
+                </optgroup>
+              )}
+              {offlinePeers.length > 0 && (
+                <optgroup label="Hors-ligne (envoi différé à la reconnexion)">
+                  {offlinePeers.map((p) => (
+                    <option key={p.device_id} value={p.device_id}>
+                      {p.name || p.device_id} (hors-ligne · file d'attente)
+                    </option>
+                  ))}
+                </optgroup>
+              )}
             </select>
           </div>
 
-          {/* Drag & Drop Browser Files & Folders */}
           <div>
             <div className="flex items-center justify-between mb-1.5">
               <label className="text-xs font-medium text-zinc-400">
-                Fichiers ou dossiers (glisser-déposer ou sélection)
+                Fichiers ou dossiers (glisser-déposer, Ctrl+V ou sélection)
               </label>
               <button
                 type="button"
@@ -184,7 +258,7 @@ export function DropTab({
               }`}
             >
               <UploadCloud size={22} className="mx-auto text-zinc-400 mb-2" />
-              <p className="text-xs text-zinc-300 font-medium">Glisse-dépose des fichiers ou un dossier entier ici</p>
+              <p className="text-xs text-zinc-300 font-medium">Glisse-dépose des fichiers / dossiers ou colle avec Ctrl+V</p>
               <p className="text-[11px] text-zinc-500 mt-0.5">
                 Dans l'app Windows, le glisser-déposer natif envoie sans copie temporaire
               </p>
@@ -243,7 +317,6 @@ export function DropTab({
             )}
           </div>
 
-          {/* Quick Text / Clipboard Drop */}
           <div className="pt-3 border-t border-zinc-800/80">
             <label className="flex items-center gap-1.5 text-xs font-medium text-zinc-400 mb-1.5">
               <MessageSquare size={13} className="text-blue-400" /> Ou texte / lien rapide (façon presse-papiers)
@@ -257,7 +330,6 @@ export function DropTab({
             />
           </div>
 
-          {/* Host Local Paths */}
           <div className="pt-3 border-t border-zinc-800/80">
             <div className="flex items-center justify-between mb-1.5">
               <label className="text-xs font-medium text-zinc-400">
@@ -306,7 +378,7 @@ export function DropTab({
             disabled={isUploading}
             className="w-full py-2.5 rounded-md bg-blue-600 hover:bg-blue-500 disabled:opacity-60 font-medium text-xs text-white transition"
           >
-            {isUploading ? `Préparation du transfert (${uploadPct}%)...` : "Envoyer en P2P direct"}
+            {isUploading ? `Envoi vers le daemon (${uploadPct}%)...` : "Envoyer en P2P direct"}
           </button>
         </form>
 
@@ -324,6 +396,14 @@ export function DropTab({
                     ? Math.ceil((t.total_size - t.transferred_bytes) / speedBps)
                     : 0;
                 const isText = t.kind === "text";
+                const statusLabel = DROP_STATUS_LABEL[t.status] || t.status;
+                const canCancel =
+                  t.status === "preparing" ||
+                  t.status === "queued_offline" ||
+                  t.status === "pending_accept" ||
+                  t.status === "transferring" ||
+                  t.status === "paused" ||
+                  t.status === "failed";
                 return (
                   <div key={t.transfer_id} className="bg-[#0b0d11] border border-zinc-800 rounded-md p-3 space-y-2">
                     <div className="flex items-center justify-between text-xs gap-2">
@@ -338,10 +418,12 @@ export function DropTab({
                               ? "bg-emerald-500/10 text-emerald-300"
                               : t.status === "failed" || t.status === "rejected" || t.status === "canceled"
                               ? "bg-rose-500/10 text-rose-300"
+                              : t.status === "queued_offline" || t.status === "preparing"
+                              ? "bg-amber-500/10 text-amber-300"
                               : "bg-blue-500/10 text-blue-300"
                           }`}
                         >
-                          {t.status}
+                          {statusLabel}
                         </span>
                         <button
                           onClick={() => apiFetch(`/api/v1/drop/${t.transfer_id}`, { method: "DELETE" }).then(onReload)}
@@ -388,36 +470,45 @@ export function DropTab({
                       </>
                     )}
 
-                    {!isText &&
-                      (t.status === "transferring" ||
-                        t.status === "paused" ||
-                        t.status === "failed" ||
-                        t.status === "pending_accept") && (
-                        <div className="flex gap-2 pt-1">
-                          {t.direction === "send" && t.status === "transferring" && (
-                            <button
-                              onClick={() => apiFetch(`/api/v1/drop/${t.transfer_id}/pause`, { method: "POST" }).then(onReload)}
-                              className="text-xs px-2.5 py-1 rounded bg-zinc-800 hover:bg-zinc-700"
-                            >
-                              Pause
-                            </button>
-                          )}
-                          {t.direction === "send" && (t.status === "paused" || t.status === "failed") && (
-                            <button
-                              onClick={() => apiFetch(`/api/v1/drop/${t.transfer_id}/resume`, { method: "POST" }).then(onReload)}
-                              className="text-xs px-2.5 py-1 rounded bg-blue-600 hover:bg-blue-500 text-white"
-                            >
-                              Reprendre
-                            </button>
-                          )}
-                          <button
-                            onClick={() => apiFetch(`/api/v1/drop/${t.transfer_id}/cancel`, { method: "POST" }).then(onReload)}
-                            className="text-xs px-2.5 py-1 rounded bg-zinc-800 hover:bg-rose-900/60 text-rose-300"
-                          >
-                            Annuler
-                          </button>
-                        </div>
+                    <div className="flex flex-wrap gap-2 pt-0.5">
+                      {!isText && (t.status === "transferring" || t.status === "preparing") && (
+                        <button
+                          onClick={() => apiFetch(`/api/v1/drop/${t.transfer_id}/pause`, { method: "POST" }).then(onReload)}
+                          className="text-xs px-2.5 py-1 rounded bg-zinc-800 hover:bg-zinc-700"
+                        >
+                          Pause
+                        </button>
                       )}
+                      {!isText && (t.status === "paused" || t.status === "failed") && (
+                        <button
+                          onClick={() => apiFetch(`/api/v1/drop/${t.transfer_id}/resume`, { method: "POST" }).then(onReload)}
+                          className="text-xs px-2.5 py-1 rounded bg-blue-600 hover:bg-blue-500 text-white"
+                        >
+                          Reprendre
+                        </button>
+                      )}
+                      {canCancel && (
+                        <button
+                          onClick={() => apiFetch(`/api/v1/drop/${t.transfer_id}/cancel`, { method: "POST" }).then(onReload)}
+                          className="text-xs px-2.5 py-1 rounded bg-zinc-800 hover:bg-rose-900/60 text-rose-300"
+                        >
+                          Annuler
+                        </button>
+                      )}
+                      {!isText &&
+                        t.direction === "receive" &&
+                        t.status === "completed" &&
+                        status?.is_loopback &&
+                        (t.dest_dir || status?.drop_inbox_dir) && (
+                          <button
+                            type="button"
+                            onClick={() => openDestDir(t.dest_dir || status.drop_inbox_dir)}
+                            className="inline-flex items-center gap-1 text-xs px-2.5 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-200"
+                          >
+                            <FolderOpen size={12} /> Ouvrir le dossier
+                          </button>
+                        )}
+                    </div>
                     {t.error_msg && <p className="text-[11px] text-rose-400">{t.error_msg}</p>}
                   </div>
                 );

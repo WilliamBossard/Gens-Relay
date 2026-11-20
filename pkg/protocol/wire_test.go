@@ -43,3 +43,33 @@ func TestWriteAndReadFrameCompressionRoundTrip(t *testing.T) {
 		t.Fatalf("unexpected decoded large frame: %+v", gotLarge)
 	}
 }
+
+func TestUDPRelayPacketRoundTrip(t *testing.T) {
+	var tok [16]byte
+	for i := range tok {
+		tok[i] = byte(i + 1)
+	}
+	payload := []byte("quic-encrypted-packet-bytes")
+	pkt := EncodeUDPRelayPacket(nil, tok, "abcd-efgh", payload)
+
+	gotTok, gotPeer, gotPayload, ok := DecodeUDPRelayPacket(pkt)
+	if !ok {
+		t.Fatal("DecodeUDPRelayPacket failed")
+	}
+	if gotTok != tok {
+		t.Fatalf("token mismatch")
+	}
+	if gotPeer != "ABCD-EFGH" {
+		t.Fatalf("expected normalized peer ID, got %q", gotPeer)
+	}
+	if !bytes.Equal(gotPayload, payload) {
+		t.Fatalf("payload mismatch")
+	}
+
+	// Empty peerID keepalive probe
+	probe := EncodeUDPRelayPacket(nil, tok, "", nil)
+	gotTok, gotPeer, gotPayload, ok = DecodeUDPRelayPacket(probe)
+	if !ok || gotTok != tok || gotPeer != "" || len(gotPayload) != 0 {
+		t.Fatalf("probe decode mismatch: ok=%v peer=%q len=%d", ok, gotPeer, len(gotPayload))
+	}
+}

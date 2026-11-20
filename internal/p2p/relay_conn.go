@@ -28,27 +28,29 @@ type incomingRelayPkt struct {
 	addr    net.Addr
 }
 
-// relayPacketConn is a pure-virtual net.PacketConn multiplexing opaque blind-relay packets
-// from relay-server's WebSocket so direct UDP QUIC traffic can run directly on *net.UDPConn
-// with full kernel GSO/ECN/buffer optimizations.
+// relayPacketConn is a virtual net.PacketConn multiplexing opaque blind-relay packets
+// (both native UDP Relay and WebSocket binary fallback) while direct UDP QUIC runs directly
+// on *net.UDPConn with full kernel GSO/ECN/buffer optimizations.
 type relayPacketConn struct {
 	localAddr func() net.Addr
 	sendRelay func(ctx context.Context, targetID string, pkt []byte) error
 
-	rxCh  chan incomingRelayPkt
-	done  chan struct{}
-	once  sync.Once
-	mu    sync.Mutex
-	rDead time.Time
-	wDead time.Time
+	rxCh       chan incomingRelayPkt
+	deadNotify chan struct{}
+	done       chan struct{}
+	once       sync.Once
+	mu         sync.Mutex
+	rDead      time.Time
+	wDead      time.Time
 }
 
 func newRelayPacketConn(localAddr func() net.Addr, sendRelay func(ctx context.Context, targetID string, pkt []byte) error) *relayPacketConn {
 	return &relayPacketConn{
-		localAddr: localAddr,
-		sendRelay: sendRelay,
-		rxCh:      make(chan incomingRelayPkt, 2048),
-		done:      make(chan struct{}),
+		localAddr:  localAddr,
+		sendRelay:  sendRelay,
+		rxCh:       make(chan incomingRelayPkt, 2048),
+		deadNotify: make(chan struct{}, 1),
+		done:       make(chan struct{}),
 	}
 }
 
@@ -79,38 +81,46 @@ func (c *relayPacketConn) DeliverRelayPacket(senderID string, data []byte) {
 }
 
 func (c *relayPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	select {
-	case <-c.done:
-		return 0, nil, net.ErrClosed
-	default:
-	}
-
-	c.mu.Lock()
-	dead := c.rDead
-	c.mu.Unlock()
-
-	if !dead.IsZero() {
-		d := time.Until(dead)
-		if d <= 0 {
-			return 0, nil, osTimeoutErr{}
-		}
-		t := time.NewTimer(d)
-		defer t.Stop()
+	for {
 		select {
 		case <-c.done:
 			return 0, nil, net.ErrClosed
-		case <-t.C:
-			return 0, nil, osTimeoutErr{}
+		default:
+		}
+
+		c.mu.Lock()
+		dead := c.rDead
+		c.mu.Unlock()
+
+		if !dead.IsZero() {
+			d := time.Until(dead)
+			if d <= 0 {
+				return 0, nil, osTimeoutErr{}
+			}
+			t := time.NewTimer(d)
+			select {
+			case <-c.done:
+				t.Stop()
+				return 0, nil, net.ErrClosed
+			case <-c.deadNotify:
+				t.Stop()
+				continue
+			case <-t.C:
+				return 0, nil, osTimeoutErr{}
+			case pkt := <-c.rxCh:
+				t.Stop()
+				return c.copyOut(p, pkt)
+			}
+		}
+
+		select {
+		case <-c.done:
+			return 0, nil, net.ErrClosed
+		case <-c.deadNotify:
+			continue
 		case pkt := <-c.rxCh:
 			return c.copyOut(p, pkt)
 		}
-	}
-
-	select {
-	case <-c.done:
-		return 0, nil, net.ErrClosed
-	case pkt := <-c.rxCh:
-		return c.copyOut(p, pkt)
 	}
 }
 
@@ -187,6 +197,10 @@ func (c *relayPacketConn) SetReadDeadline(t time.Time) error {
 	c.mu.Lock()
 	c.rDead = t
 	c.mu.Unlock()
+	select {
+	case c.deadNotify <- struct{}{}:
+	default:
+	}
 	return nil
 }
 

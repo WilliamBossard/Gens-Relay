@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -20,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/WilliamBossard/Gens-Relay/internal/chunker"
 	"github.com/WilliamBossard/Gens-Relay/internal/config"
 	"github.com/WilliamBossard/Gens-Relay/internal/drop"
 	"github.com/WilliamBossard/Gens-Relay/internal/logs"
@@ -36,6 +38,11 @@ type wsSub struct {
 	send chan []byte
 }
 
+type authFailEntry struct {
+	count   int
+	resetAt time.Time
+}
+
 type Server struct {
 	id            *protocol.Identity
 	cfg           *config.DaemonConfig
@@ -47,6 +54,9 @@ type Server struct {
 	onShutdown    func()
 	shutdownToken string
 	rootCtx       context.Context
+
+	authFailMu sync.Mutex
+	authFails  map[string]*authFailEntry
 
 	wsMu      sync.Mutex
 	wsClients map[*wsSub]struct{}
@@ -63,6 +73,7 @@ func NewServer(id *protocol.Identity, cfg *config.DaemonConfig, st *store.Store,
 		drop:      dropMgr,
 		logs:      logBuf,
 		rootCtx:   context.Background(),
+		authFails: make(map[string]*authFailEntry),
 		wsClients: make(map[*wsSub]struct{}),
 		eventCh:   make(chan []byte, 512),
 	}
@@ -117,11 +128,17 @@ func (s *Server) BroadcastEvent(event string, data any) {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
+	mux.HandleFunc("GET /api/v1/setup/status", s.handleSetupStatus)
+	mux.HandleFunc("POST /api/v1/setup", s.handleSetupComplete)
 	mux.HandleFunc("GET /api/v1/status", s.handleStatus)
 	mux.HandleFunc("POST /api/v1/config", s.handleUpdateConfig)
 	mux.HandleFunc("GET /api/v1/events", s.handleEvents)
 	mux.HandleFunc("GET /api/v1/logs", s.handleLogs)
 	mux.HandleFunc("GET /api/v1/local-browse", s.handleLocalBrowse)
+	mux.HandleFunc("POST /api/v1/open-path", s.handleOpenPath)
+	mux.HandleFunc("GET /api/v1/companion-apps", s.handleCompanionApps)
+	mux.HandleFunc("POST /api/v1/companion-apps/{app}/launch", s.handleCompanionLaunch)
+	mux.HandleFunc("POST /api/v1/companion-apps/{app}/install", s.handleCompanionInstall)
 
 	mux.HandleFunc("GET /api/v1/devices", s.handleListDevices)
 	mux.HandleFunc("POST /api/v1/devices", s.handleUpsertDevice)
@@ -147,6 +164,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/folders/{id}/conflicts/resolve", s.handleResolveConflict)
 	mux.HandleFunc("GET /api/v1/folders/{id}/versions", s.handleListVersions)
 	mux.HandleFunc("POST /api/v1/folders/{id}/versions/restore", s.handleRestoreVersion)
+	mux.HandleFunc("GET /api/v1/folder-invitations", s.handleListFolderInvitations)
+	mux.HandleFunc("POST /api/v1/folder-invitations/{id}/accept", s.handleAcceptFolderInvitation)
+	mux.HandleFunc("POST /api/v1/folder-invitations/{id}/reject", s.handleRejectFolderInvitation)
 
 	mux.HandleFunc("GET /api/v1/drop", s.handleDropList)
 	mux.HandleFunc("POST /api/v1/drop/send", s.handleDropSend)
@@ -222,6 +242,59 @@ func (s *Server) originMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+func remoteIP(r *http.Request) net.IP {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	return net.ParseIP(host)
+}
+
+func isLoopbackRequest(r *http.Request) bool {
+	ip := remoteIP(r)
+	return ip != nil && ip.IsLoopback()
+}
+
+func (s *Server) allowAuth(ip string) bool {
+	if ip == "" {
+		return true
+	}
+	now := time.Now()
+	s.authFailMu.Lock()
+	defer s.authFailMu.Unlock()
+	ent, ok := s.authFails[ip]
+	if !ok || now.After(ent.resetAt) {
+		return true
+	}
+	return ent.count < 5
+}
+
+func (s *Server) recordAuthResult(ip string, ok bool) {
+	if ip == "" {
+		return
+	}
+	now := time.Now()
+	s.authFailMu.Lock()
+	defer s.authFailMu.Unlock()
+	if len(s.authFails) > 1000 {
+		for k, v := range s.authFails {
+			if now.After(v.resetAt) {
+				delete(s.authFails, k)
+			}
+		}
+	}
+	if ok {
+		delete(s.authFails, ip)
+		return
+	}
+	ent, exists := s.authFails[ip]
+	if !exists || now.After(ent.resetAt) {
+		s.authFails[ip] = &authFailEntry{count: 1, resetAt: now.Add(1 * time.Minute)}
+		return
+	}
+	ent.count++
+}
+
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/v1/shutdown" && s.shutdownToken != "" {
@@ -231,18 +304,109 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 				return
 			}
 		}
-		if s.cfg.Snapshot().WebPassHash == "" {
+		if r.URL.Path == "/api/v1/setup/status" || r.URL.Path == "/api/v1/setup" {
 			next.ServeHTTP(w, r)
 			return
 		}
+
+		snap := s.cfg.Snapshot()
+		if snap.WebPassHash == "" {
+			// Local apps & localhost browser run passwordless out of the box.
+			// Non-loopback clients (Docker/TrueNAS/LAN remote UI) must complete First-Run Setup first.
+			if !strings.HasPrefix(r.URL.Path, "/api/") || isLoopbackRequest(r) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			writeError(w, http.StatusForbidden, "setup_required")
+			return
+		}
+
+		ipStr := ""
+		if ip := remoteIP(r); ip != nil {
+			ipStr = ip.String()
+		}
+		if !s.allowAuth(ipStr) {
+			http.Error(w, "Too many failed authentication attempts", http.StatusTooManyRequests)
+			return
+		}
+
 		user, pass, ok := r.BasicAuth()
 		if !ok || !s.cfg.VerifyWebAuth(user, pass) {
+			s.recordAuthResult(ipStr, false)
 			w.Header().Set("WWW-Authenticate", `Basic realm="Gens-Relay"`)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
+		s.recordAuthResult(ipStr, true)
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (s *Server) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
+	snap := s.cfg.Snapshot()
+	isLoop := isLoopbackRequest(r)
+	needsSetup := snap.WebPassHash == ""
+	resp := map[string]any{
+		"needs_setup": needsSetup,
+		"is_loopback": isLoop,
+	}
+	if needsSetup {
+		resp["web_user"] = snap.WebUser
+		resp["node_name"] = snap.NodeName
+		resp["drop_inbox_dir"] = snap.DropInboxDir
+		resp["relay_url"] = snap.RelayURL
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleSetupComplete(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.Snapshot().WebPassHash != "" {
+		writeError(w, http.StatusConflict, "setup already completed")
+		return
+	}
+	var body struct {
+		WebUser      string   `json:"web_user"`
+		WebPassword  string   `json:"web_password"`
+		NodeName     string   `json:"node_name"`
+		RelayURL     string   `json:"relay_url"`
+		RelayURLs    []string `json:"relay_urls"`
+		DropInboxDir string   `json:"drop_inbox_dir"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if len(body.WebPassword) < 4 {
+		writeError(w, http.StatusBadRequest, "mot de passe trop court (minimum 4 caractères)")
+		return
+	}
+	if err := s.cfg.Update(func(c *config.DaemonConfig) {
+		if u := strings.TrimSpace(body.WebUser); u != "" {
+			c.WebUser = u
+		}
+		if n := strings.TrimSpace(body.NodeName); n != "" {
+			c.NodeName = n
+		}
+		if ru := strings.TrimSpace(body.RelayURL); ru != "" {
+			c.RelayURL = normalizeRelayURL(ru)
+		}
+		if len(body.RelayURLs) > 0 {
+			c.RelayURLs = normalizeRelayURLList(body.RelayURLs)
+		}
+		if d := strings.TrimSpace(body.DropInboxDir); d != "" {
+			c.DropInboxDir = d
+			_ = os.MkdirAll(d, 0755)
+		}
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := s.cfg.SetWebPassword(body.WebPassword); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.p2p.RestartRelay()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
@@ -292,40 +456,73 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
+func normalizeRelayURL(raw string) string {
+	u := strings.TrimSpace(raw)
+	if u != "" && !strings.Contains(u, "://") {
+		u = "ws://" + u
+	}
+	return u
+}
+
+func normalizeRelayURLList(list []string) []string {
+	var out []string
+	seen := make(map[string]struct{}, len(list))
+	for _, raw := range list {
+		u := normalizeRelayURL(raw)
+		if u == "" {
+			continue
+		}
+		if _, dup := seen[u]; !dup {
+			seen[u] = struct{}{}
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	snap := s.cfg.Snapshot()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"device_id":         s.id.DeviceID,
-		"node_name":         snap.NodeName,
-		"quic_port":         s.p2p.QUICPort(),
-		"lan_addrs":         p2p.LocalLANAddrs(s.p2p.QUICPort()),
-		"relay_url":         snap.RelayURL,
-		"relay_connected":   s.p2p.RelayConnected(),
-		"has_auth_token":    snap.AuthToken != "",
-		"has_web_password":  snap.WebPassHash != "",
-		"drop_inbox_dir":    snap.DropInboxDir,
-		"max_upload_kbps":   snap.MaxUploadKBps,
-		"max_download_kbps": snap.MaxDownloadKBps,
-		"web_listen":        snap.WebListen,
-		"web_tls":           snap.WebTLS,
-		"web_user":          snap.WebUser,
+		"device_id":            s.id.DeviceID,
+		"node_name":            snap.NodeName,
+		"quic_port":            s.p2p.QUICPort(),
+		"lan_addrs":            p2p.LocalLANAddrs(s.p2p.QUICPort()),
+		"relay_url":            snap.RelayURL,
+		"relay_urls":           snap.RelayURLs,
+		"active_relay_url":     s.p2p.ActiveRelayURL(),
+		"relay_transport_mode": s.p2p.RelayTransportMode(),
+		"relay_connected":      s.p2p.RelayConnected(),
+		"has_auth_token":       snap.AuthToken != "",
+		"has_web_password":     snap.WebPassHash != "",
+		"drop_inbox_dir":       snap.DropInboxDir,
+		"max_upload_kbps":      snap.MaxUploadKBps,
+		"max_download_kbps":    snap.MaxDownloadKBps,
+		"enable_upnp":          snap.EnableUPnP,
+		"enable_compression":   snap.EnableCompression,
+		"web_listen":           snap.WebListen,
+		"web_tls":              snap.WebTLS,
+		"web_user":             snap.WebUser,
+		"is_loopback":          isLoopbackRequest(r),
 	})
 }
 
 func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		NodeName         string  `json:"node_name"`
-		RelayURL         string  `json:"relay_url"`
-		AuthToken        string  `json:"auth_token"`
-		ClearAuthToken   bool    `json:"clear_auth_token"`
-		DropInboxDir     string  `json:"drop_inbox_dir"`
-		MaxUploadKBps    int     `json:"max_upload_kbps"`
-		MaxDownloadKBps  int     `json:"max_download_kbps"`
-		WebListen        string  `json:"web_listen"`
-		WebTLS           *bool   `json:"web_tls"`
-		WebUser          *string `json:"web_user"`
-		WebPassword      string  `json:"web_password"`
-		ClearWebPassword bool    `json:"clear_web_password"`
+		NodeName          string    `json:"node_name"`
+		RelayURL          *string   `json:"relay_url"`
+		RelayURLs         *[]string `json:"relay_urls"`
+		AuthToken         string    `json:"auth_token"`
+		ClearAuthToken    bool      `json:"clear_auth_token"`
+		DropInboxDir      string    `json:"drop_inbox_dir"`
+		MaxUploadKBps     *int      `json:"max_upload_kbps"`
+		MaxDownloadKBps   *int      `json:"max_download_kbps"`
+		EnableUPnP        *bool     `json:"enable_upnp"`
+		EnableCompression *bool     `json:"enable_compression"`
+		WebListen         string    `json:"web_listen"`
+		WebTLS            *bool     `json:"web_tls"`
+		WebUser           *string   `json:"web_user"`
+		WebPassword       string    `json:"web_password"`
+		ClearWebPassword  bool      `json:"clear_web_password"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -336,11 +533,12 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		if body.NodeName != "" {
 			c.NodeName = body.NodeName
 		}
-		relayURL := strings.TrimSpace(body.RelayURL)
-		if relayURL != "" && !strings.Contains(relayURL, "://") {
-			relayURL = "ws://" + relayURL
+		if body.RelayURL != nil {
+			c.RelayURL = normalizeRelayURL(*body.RelayURL)
 		}
-		c.RelayURL = relayURL
+		if body.RelayURLs != nil {
+			c.RelayURLs = normalizeRelayURLList(*body.RelayURLs)
+		}
 		if body.ClearAuthToken {
 			c.AuthToken = ""
 		} else if body.AuthToken != "" {
@@ -350,11 +548,17 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 			c.DropInboxDir = body.DropInboxDir
 			_ = os.MkdirAll(c.DropInboxDir, 0755)
 		}
-		if body.MaxUploadKBps >= 0 {
-			c.MaxUploadKBps = body.MaxUploadKBps
+		if body.MaxUploadKBps != nil && *body.MaxUploadKBps >= 0 {
+			c.MaxUploadKBps = *body.MaxUploadKBps
 		}
-		if body.MaxDownloadKBps >= 0 {
-			c.MaxDownloadKBps = body.MaxDownloadKBps
+		if body.MaxDownloadKBps != nil && *body.MaxDownloadKBps >= 0 {
+			c.MaxDownloadKBps = *body.MaxDownloadKBps
+		}
+		if body.EnableUPnP != nil {
+			c.EnableUPnP = *body.EnableUPnP
+		}
+		if body.EnableCompression != nil {
+			c.EnableCompression = *body.EnableCompression
 		}
 		if body.WebListen != "" {
 			c.WebListen = body.WebListen
@@ -382,7 +586,7 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	newSnap := s.cfg.Snapshot()
-	needsRestart := newSnap.WebListen != prevSnap.WebListen || newSnap.WebTLS != prevSnap.WebTLS
+	needsRestart := newSnap.WebListen != prevSnap.WebListen || newSnap.WebTLS != prevSnap.WebTLS || newSnap.EnableUPnP != prevSnap.EnableUPnP
 	s.p2p.RefreshRateLimiters()
 	s.p2p.RestartRelay()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "needs_restart": needsRestart})
@@ -518,6 +722,7 @@ func (s *Server) handleDeleteDevice(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.p2p.DisconnectPeer(id)
 	s.syncer.ReloadFolders()
 	s.BroadcastEvent("peers_updated", s.p2p.PeerStatuses())
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -758,6 +963,217 @@ func (s *Server) handleRestoreVersion(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+func (s *Server) handleListFolderInvitations(w http.ResponseWriter, _ *http.Request) {
+	list, err := s.store.ListFolderInvitations()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if list == nil {
+		list = []store.FolderInvitationRecord{}
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+func (s *Server) handleAcceptFolderInvitation(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SenderID  string `json:"sender_id"`
+		LocalPath string `json:"local_path"`
+		Mode      string `json:"mode"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var mode protocol.FolderMode
+	switch body.Mode {
+	case "send_only", "sendonly":
+		mode = protocol.ModeSendOnly
+	case "receive_only", "receiveonly":
+		mode = protocol.ModeReceiveOnly
+	default:
+		mode = protocol.ModeSendReceive
+	}
+	if err := s.syncer.AcceptInvitation(r.PathValue("id"), body.SenderID, body.LocalPath, mode); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleRejectFolderInvitation(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SenderID string `json:"sender_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.syncer.RejectInvitation(r.PathValue("id"), body.SenderID); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleOpenPath(w http.ResponseWriter, r *http.Request) {
+	if !isLoopbackRequest(r) {
+		writeError(w, http.StatusForbidden, "open-path allowed only from loopback")
+		return
+	}
+	var body struct {
+		Path   string `json:"path"`
+		Reveal bool   `json:"reveal"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	cleanPath := filepath.Clean(strings.TrimSpace(body.Path))
+	if cleanPath == "" || cleanPath == "." {
+		writeError(w, http.StatusBadRequest, "path is required")
+		return
+	}
+	info, err := os.Stat(cleanPath)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("chemin introuvable : %v", err))
+		return
+	}
+
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		if body.Reveal && !info.IsDir() {
+			cmd = exec.Command("explorer.exe", "/select,"+cleanPath)
+		} else if !info.IsDir() {
+			cmd = exec.Command("explorer.exe", filepath.Dir(cleanPath))
+		} else {
+			cmd = exec.Command("explorer.exe", cleanPath)
+		}
+	case "darwin":
+		if body.Reveal && !info.IsDir() {
+			cmd = exec.Command("open", "-R", cleanPath)
+		} else {
+			cmd = exec.Command("open", cleanPath)
+		}
+	default:
+		target := cleanPath
+		if !info.IsDir() {
+			target = filepath.Dir(cleanPath)
+		}
+		cmd = exec.Command("xdg-open", target)
+	}
+	if err := cmd.Start(); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+type companionPaths struct {
+	DesktopPath   string
+	DropPath      string
+	InstallerPath string
+}
+
+func detectCompanionPaths() companionPaths {
+	var candidates []string
+	if exe, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exe)
+		candidates = append(candidates, exeDir, filepath.Dir(exeDir))
+	}
+	if runtime.GOOS == "windows" {
+		if pf := os.Getenv("ProgramFiles"); pf != "" {
+			candidates = append(candidates, filepath.Join(pf, "Gens-Relay"))
+		}
+		if local := os.Getenv("LOCALAPPDATA"); local != "" {
+			candidates = append(candidates, filepath.Join(local, "Programs", "Gens-Relay"))
+		}
+	}
+
+	desktopName := "gens-relay-desktop"
+	dropName := "gens-drop-desktop"
+	if runtime.GOOS == "windows" {
+		desktopName += ".exe"
+		dropName += ".exe"
+	}
+
+	findFile := func(relNames ...string) string {
+		for _, base := range candidates {
+			for _, rel := range relNames {
+				p := filepath.Join(base, rel)
+				if info, err := os.Stat(p); err == nil && !info.IsDir() {
+					return p
+				}
+			}
+		}
+		return ""
+	}
+
+	return companionPaths{
+		DesktopPath:   findFile(desktopName),
+		DropPath:      findFile(dropName),
+		InstallerPath: findFile(filepath.Join("setup", "gens-relay-setup.exe"), "gens-relay-setup.exe"),
+	}
+}
+
+func (s *Server) handleCompanionApps(w http.ResponseWriter, r *http.Request) {
+	paths := detectCompanionPaths()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"desktop_installed":   paths.DesktopPath != "",
+		"drop_installed":      paths.DropPath != "",
+		"installer_available": paths.InstallerPath != "",
+		"desktop_path":        paths.DesktopPath,
+		"drop_path":           paths.DropPath,
+		"installer_path":      paths.InstallerPath,
+		"is_loopback":         isLoopbackRequest(r),
+	})
+}
+
+func (s *Server) handleCompanionLaunch(w http.ResponseWriter, r *http.Request) {
+	if !isLoopbackRequest(r) {
+		writeError(w, http.StatusForbidden, "companion launch allowed only from loopback")
+		return
+	}
+	paths := detectCompanionPaths()
+	var target string
+	switch r.PathValue("app") {
+	case "desktop":
+		target = paths.DesktopPath
+	case "drop":
+		target = paths.DropPath
+	default:
+		writeError(w, http.StatusBadRequest, "unknown companion app")
+		return
+	}
+	if target == "" {
+		writeError(w, http.StatusNotFound, "application compagnon non installée sur ce PC")
+		return
+	}
+	if err := exec.Command(target).Start(); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleCompanionInstall(w http.ResponseWriter, r *http.Request) {
+	if !isLoopbackRequest(r) {
+		writeError(w, http.StatusForbidden, "companion install allowed only from loopback")
+		return
+	}
+	paths := detectCompanionPaths()
+	if paths.InstallerPath == "" {
+		writeError(w, http.StatusNotFound, "installateur introuvable localement — télécharge gens-relay-setup.exe depuis les Releases GitHub")
+		return
+	}
+	if err := exec.Command(paths.InstallerPath).Start(); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
 func (s *Server) handleDropList(w http.ResponseWriter, _ *http.Request) {
 	list, err := s.drop.ListTransfers()
 	if err != nil {
@@ -821,6 +1237,65 @@ func safeUploadJoin(root, rel string) (string, error) {
 	return full, nil
 }
 
+// streamingBlockHasher computes BLAKE3 block hashes and Merkle FileHash on the fly
+// during io.Copy so browser multipart uploads never require a second disk read pass.
+type streamingBlockHasher struct {
+	blockSize int
+	bufPtr    *[]byte
+	filled    int
+	offset    int64
+	blocks    []protocol.BlockInfo
+}
+
+func newStreamingBlockHasher(blockSize int) *streamingBlockHasher {
+	if blockSize <= 0 {
+		blockSize = chunker.DefaultBlockSize
+	}
+	return &streamingBlockHasher{
+		blockSize: blockSize,
+		bufPtr:    chunker.GetBufferSize(blockSize),
+	}
+}
+
+func (h *streamingBlockHasher) Write(p []byte) (int, error) {
+	total := len(p)
+	buf := (*h.bufPtr)[:h.blockSize]
+	for len(p) > 0 {
+		n := copy(buf[h.filled:], p)
+		h.filled += n
+		p = p[n:]
+		if h.filled == h.blockSize {
+			sum := chunker.HashBytes(buf[:h.blockSize])
+			h.blocks = append(h.blocks, protocol.BlockInfo{
+				Offset: h.offset,
+				Size:   h.blockSize,
+				Hash:   sum,
+			})
+			h.offset += int64(h.blockSize)
+			h.filled = 0
+		}
+	}
+	return total, nil
+}
+
+func (h *streamingBlockHasher) Finish() ([]protocol.BlockInfo, string, int64) {
+	if h.filled > 0 {
+		buf := (*h.bufPtr)[:h.filled]
+		h.blocks = append(h.blocks, protocol.BlockInfo{
+			Offset: h.offset,
+			Size:   h.filled,
+			Hash:   chunker.HashBytes(buf),
+		})
+		h.offset += int64(h.filled)
+		h.filled = 0
+	}
+	if h.bufPtr != nil {
+		chunker.PutBufferSized(h.bufPtr)
+		h.bufPtr = nil
+	}
+	return h.blocks, chunker.ComputeMerkleFileHash(h.blocks), h.offset
+}
+
 func (s *Server) handleDropUpload(w http.ResponseWriter, r *http.Request) {
 	mr, err := r.MultipartReader()
 	if err != nil {
@@ -849,8 +1324,7 @@ func (s *Server) handleDropUpload(w http.ResponseWriter, r *http.Request) {
 
 	var peerID string
 	var nextRelPath string
-	topSet := make(map[string]struct{})
-	var stagedPaths []string
+	var stagedFiles []drop.StagedFile
 
 	for {
 		part, err := mr.NextPart()
@@ -898,32 +1372,37 @@ func (s *Server) handleDropUpload(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
-			if _, err := io.Copy(f, part); err != nil {
+			hasher := newStreamingBlockHasher(chunker.DefaultBlockSize)
+			if _, err := io.Copy(io.MultiWriter(f, hasher), part); err != nil {
+				_, _, _ = hasher.Finish()
 				_ = f.Close()
 				_ = part.Close()
 				writeError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
+			blocks, fileHash, sz := hasher.Finish()
 			_ = f.Close()
 			_ = part.Close()
 
-			topName := strings.SplitN(rel, "/", 2)[0]
-			topPath := filepath.Join(stagingDir, topName)
-			if _, seen := topSet[topPath]; !seen {
-				topSet[topPath] = struct{}{}
-				stagedPaths = append(stagedPaths, topPath)
-			}
+			stagedFiles = append(stagedFiles, drop.StagedFile{
+				RelPath:   rel,
+				LocalPath: dstPath,
+				Size:      sz,
+				BlockSize: chunker.DefaultBlockSize,
+				Blocks:    blocks,
+				FileHash:  fileHash,
+			})
 			continue
 		}
 		_ = part.Close()
 	}
 
-	if peerID == "" || len(stagedPaths) == 0 {
+	if peerID == "" || len(stagedFiles) == 0 {
 		writeError(w, http.StatusBadRequest, "peer_id et au moins un fichier sont requis")
 		return
 	}
 
-	rec, err := s.drop.SendStagedPaths(s.rootCtx, peerID, stagingDir, stagedPaths)
+	rec, err := s.drop.SendPrehashedStagedPaths(s.rootCtx, peerID, stagingDir, stagedFiles)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return

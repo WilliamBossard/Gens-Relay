@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"flag"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -67,9 +69,10 @@ func main() {
 
 	// Clean orphaned .gens.tmp files and stale browser upload staging directories on startup
 	activeDropIDs, _ := st.ListActiveDropTransferIDs()
+	activeStaging, _ := st.ListActiveDropStagingDirs()
 	inboxDir := cfg.Snapshot().DropInboxDir
 	config.CleanupOrphanedTemps(inboxDir, activeDropIDs)
-	config.CleanupOrphanedStaging(filepath.Join(dataDir, "drop_staging"), filepath.Join(inboxDir, ".gens.staging"))
+	config.CleanupOrphanedStaging(activeStaging, filepath.Join(dataDir, "drop_staging"), filepath.Join(inboxDir, ".gens.staging"))
 	_ = st.PruneOldDropTransfers(30 * 24 * time.Hour)
 	if folders, err := st.ListFolders(); err == nil {
 		for _, f := range folders {
@@ -96,8 +99,33 @@ func main() {
 	_, _ = rand.Read(tokBytes[:])
 	shutdownToken := hex.EncodeToString(tokBytes[:])
 	shutdownTokenPath := filepath.Join(dataDir, "shutdown.token")
+	shutdownReqPath := filepath.Join(dataDir, "shutdown.req")
+	_ = os.Remove(shutdownReqPath)
 	_ = os.WriteFile(shutdownTokenPath, []byte(shutdownToken), 0600)
 	defer os.Remove(shutdownTokenPath)
+	defer os.Remove(shutdownReqPath)
+
+	// Watch local shutdown.req file so desktop wrappers can trigger clean exit even with HTTPS Web UI enabled
+	go func() {
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if raw, err := os.ReadFile(shutdownReqPath); err == nil {
+					got := strings.TrimSpace(string(raw))
+					if subtle.ConstantTimeCompare([]byte(got), []byte(shutdownToken)) == 1 {
+						_ = os.Remove(shutdownReqPath)
+						log.Println("[gens-daemon] Graceful shutdown requested via IPC token.")
+						stop()
+						return
+					}
+				}
+			}
+		}
+	}()
 
 	var apiSrv *webapi.Server
 	emit := func(event string, data any) {
@@ -138,7 +166,7 @@ func main() {
 		},
 		OnControlMessage: func(c context.Context, peerID string, env protocol.ControlEnvelope) {
 			switch env.Type {
-			case protocol.CtrlFolderSummary, protocol.CtrlFolderIndex:
+			case protocol.CtrlFolderSummary, protocol.CtrlFolderIndex, protocol.CtrlFolderInvite, protocol.CtrlFolderInviteReject:
 				if syncMgr != nil {
 					syncMgr.HandleControlMessage(c, peerID, env)
 				}
@@ -235,5 +263,8 @@ func main() {
 	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = httpSrv.Shutdown(shutCtx)
+	syncMgr.Shutdown(shutCtx)
+	dropMgr.Shutdown(shutCtx)
+	p2pMgr.Shutdown(shutCtx)
 	log.Println("[gens-daemon] Shutdown complete.")
 }

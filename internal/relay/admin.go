@@ -26,6 +26,8 @@ type adminWsSub struct {
 
 func (s *Server) AdminHandler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/setup/status", s.handleAdminSetupStatus)
+	mux.HandleFunc("POST /api/v1/setup", s.handleAdminSetupComplete)
 	mux.HandleFunc("GET /api/v1/status", s.handleAdminStatus)
 	mux.HandleFunc("GET /api/v1/clients", s.handleAdminClients)
 	mux.HandleFunc("POST /api/v1/clients/{id}/kick", s.handleAdminKick)
@@ -66,13 +68,22 @@ func (s *Server) AdminHandler() http.Handler {
 	return s.adminAuthMiddleware(s.adminOriginMiddleware(mux))
 }
 
-func isAdminLoopback(r *http.Request) bool {
+func remoteHostIP(r *http.Request) net.IP {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
 	}
-	ip := net.ParseIP(host)
+	return net.ParseIP(host)
+}
+
+func isAdminLoopback(r *http.Request) bool {
+	ip := remoteHostIP(r)
 	return ip != nil && ip.IsLoopback()
+}
+
+func isAdminLocalNet(r *http.Request) bool {
+	ip := remoteHostIP(r)
+	return ip != nil && (ip.IsLoopback() || ip.IsPrivate())
 }
 
 func isAllowedAdminOrigin(origin, host string) bool {
@@ -121,23 +132,109 @@ func (s *Server) adminAuthMiddleware(next http.Handler) http.Handler {
 				return
 			}
 		}
-		snap := s.cfg.Snapshot()
-		if snap.AdminPassHash == "" {
-			if !isAdminLoopback(r) {
-				http.Error(w, "Admin access requires RELAY_ADMIN_PASS when accessed remotely", http.StatusForbidden)
-				return
-			}
+		if r.URL.Path == "/api/v1/setup/status" || r.URL.Path == "/api/v1/setup" {
 			next.ServeHTTP(w, r)
 			return
 		}
+
+		snap := s.cfg.Snapshot()
+		if snap.AdminPassHash == "" {
+			// Allow static UI assets so First-Run Setup Wizard renders in browser,
+			// and allow loopback admin requests; block remote API calls until setup completes.
+			if !strings.HasPrefix(r.URL.Path, "/api/") || isAdminLoopback(r) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			writeAdminError(w, http.StatusForbidden, "setup_required")
+			return
+		}
+
+		ipStr := ""
+		if ip := remoteHostIP(r); ip != nil {
+			ipStr = ip.String()
+		}
+		if !s.allowAdminAuth(ipStr) {
+			http.Error(w, "Too many failed authentication attempts", http.StatusTooManyRequests)
+			return
+		}
+
 		user, pass, ok := r.BasicAuth()
 		if !ok || !s.cfg.VerifyAdminAuth(user, pass) {
+			s.recordAdminAuthResult(ipStr, false)
 			w.Header().Set("WWW-Authenticate", `Basic realm="Gens-Relay-Admin"`)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
+		s.recordAdminAuthResult(ipStr, true)
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (s *Server) handleAdminSetupStatus(w http.ResponseWriter, r *http.Request) {
+	snap := s.cfg.Snapshot()
+	local := isAdminLocalNet(r)
+	writeAdminJSON(w, http.StatusOK, map[string]any{
+		"needs_setup":          snap.AdminPassHash == "",
+		"is_local":             local,
+		"requires_setup_token": !local,
+		"admin_user":           snap.AdminUser,
+	})
+}
+
+func (s *Server) handleAdminSetupComplete(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.Snapshot().AdminPassHash != "" {
+		writeAdminError(w, http.StatusConflict, "setup already completed")
+		return
+	}
+	var body struct {
+		SetupToken       string `json:"setup_token"`
+		AdminUser        string `json:"admin_user"`
+		AdminPassword    string `json:"admin_password"`
+		AuthToken        string `json:"auth_token"`
+		EnableBlindRelay bool   `json:"enable_blind_relay"`
+		MaxRelayKBps     int    `json:"max_relay_kbps"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeAdminError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !isAdminLocalNet(r) {
+		tok := strings.ToUpper(strings.TrimSpace(body.SetupToken))
+		if subtle.ConstantTimeCompare([]byte(tok), []byte(s.setupToken)) != 1 {
+			writeAdminError(w, http.StatusForbidden, "invalid setup_token for remote setup")
+			return
+		}
+	}
+	if len(body.AdminPassword) < 4 {
+		writeAdminError(w, http.StatusBadRequest, "admin password must be at least 4 characters")
+		return
+	}
+	if err := s.cfg.Update(func(rc *RelayConfig) {
+		if strings.TrimSpace(body.AdminUser) != "" {
+			rc.AdminUser = strings.TrimSpace(body.AdminUser)
+		}
+		rc.AuthToken = body.AuthToken
+		rc.EnableBlindRelay = body.EnableBlindRelay
+		if body.MaxRelayKBps >= 0 {
+			rc.MaxRelayKBps = body.MaxRelayKBps
+		}
+	}); err != nil {
+		writeAdminError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := s.cfg.SetAdminPassword(body.AdminPassword); err != nil {
+		writeAdminError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.refreshLimiter()
+	writeAdminJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) hasAdminClients() bool {
+	s.adminWsMu.Lock()
+	n := len(s.adminWsClients)
+	s.adminWsMu.Unlock()
+	return n > 0
 }
 
 func (s *Server) adminBroadcastLoop() {
@@ -157,6 +254,9 @@ func (s *Server) adminBroadcastLoop() {
 }
 
 func (s *Server) broadcastAdminEvent(event string, data any) {
+	if !s.hasAdminClients() {
+		return
+	}
 	payload, err := json.Marshal(map[string]any{
 		"event": event,
 		"data":  data,
@@ -175,6 +275,9 @@ func (s *Server) BroadcastLog(e logs.Entry) {
 }
 
 func (s *Server) broadcastAdminClients() {
+	if !s.hasAdminClients() {
+		return
+	}
 	s.broadcastAdminEvent("clients_updated", s.ClientsSnapshot())
 }
 
@@ -191,25 +294,29 @@ func (s *Server) StatusSnapshot() map[string]any {
 		maxClients = 2000
 	}
 
+	udpPort := atomic.LoadInt32(&s.stunPort)
 	return map[string]any{
-		"status":              "ok",
-		"uptime_sec":          int64(time.Since(s.startedAt).Seconds()),
-		"listen_addr":         snap.ListenAddr,
-		"admin_listen":        snap.AdminListen,
-		"stun_port":           atomic.LoadInt32(&s.stunPort),
-		"online_devices":      onlineCount,
-		"active_pair_codes":   pairCodeCount,
-		"pending_queues":      pendingCount,
-		"blind_relay_enabled": snap.EnableBlindRelay,
-		"stores_files":        false,
-		"has_auth_token":      snap.AuthToken != "",
-		"has_admin_password":  snap.AdminPassHash != "",
-		"trust_proxy":         snap.TrustProxy,
-		"max_relay_kbps":      snap.MaxRelayKBps,
-		"max_clients":         maxClients,
-		"relay_packets_total": s.relayPacketsTotal.Load(),
-		"relay_bytes_total":   s.relayBytesTotal.Load(),
-		"relay_bps":           s.relayBps.Load(),
+		"status":                "ok",
+		"uptime_sec":            int64(time.Since(s.startedAt).Seconds()),
+		"listen_addr":           snap.ListenAddr,
+		"admin_listen":          snap.AdminListen,
+		"stun_port":             udpPort,
+		"udp_relay_port":        udpPort,
+		"online_devices":        onlineCount,
+		"active_pair_codes":     pairCodeCount,
+		"pending_queues":        pendingCount,
+		"blind_relay_enabled":   snap.EnableBlindRelay,
+		"stores_files":          false,
+		"has_auth_token":        snap.AuthToken != "",
+		"has_admin_password":    snap.AdminPassHash != "",
+		"trust_proxy":           snap.TrustProxy,
+		"max_relay_kbps":        snap.MaxRelayKBps,
+		"max_clients":           maxClients,
+		"relay_packets_total":   s.relayPacketsTotal.Load(),
+		"relay_bytes_total":     s.relayBytesTotal.Load(),
+		"udp_relay_bytes_total": s.udpRelayBytesTotal.Load(),
+		"ws_relay_bytes_total":  s.wsRelayBytesTotal.Load(),
+		"relay_bps":             s.relayBps.Load(),
 	}
 }
 
@@ -223,6 +330,7 @@ type AdminClientInfo struct {
 	RelayRxBytes  uint64   `json:"relay_rx_bytes"`
 	RelayTxBytes  uint64   `json:"relay_tx_bytes"`
 	WatchingCount int      `json:"watching_count"`
+	UDPRelay      bool     `json:"udp_relay"`
 }
 
 func (s *Server) ClientsSnapshot() []AdminClientInfo {
@@ -232,6 +340,7 @@ func (s *Server) ClientsSnapshot() []AdminClientInfo {
 		c.mu.RLock()
 		obs := c.observedAddr
 		watchN := len(c.watchIDs)
+		hasUDP := c.udpRelayAddr != nil
 		c.mu.RUnlock()
 		out = append(out, AdminClientInfo{
 			DeviceID:      c.deviceID,
@@ -243,6 +352,7 @@ func (s *Server) ClientsSnapshot() []AdminClientInfo {
 			RelayRxBytes:  c.rxBytes.Load(),
 			RelayTxBytes:  c.txBytes.Load(),
 			WatchingCount: watchN,
+			UDPRelay:      hasUDP,
 		})
 	}
 	s.mu.RUnlock()

@@ -1,30 +1,58 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, Copy, FolderSync, Link2, Send, Server, Settings, Terminal } from "lucide-react";
 import { apiFetch } from "./api";
+import { CompactDropApp } from "./components/CompactDropApp";
+import { DaemonOfflineScreen } from "./components/DaemonOfflineScreen";
 import { DevicesTab } from "./components/DevicesTab";
 import { DropTab } from "./components/DropTab";
 import { LogsTab } from "./components/LogsTab";
 import { FolderModal, InspectorModal, PathPickerModal } from "./components/Modals";
 import { SettingsFormState, SettingsTab } from "./components/SettingsTab";
+import { SetupWizard } from "./components/SetupWizard";
 import { SyncTab } from "./components/SyncTab";
 import {
+  CompanionAppsInfo,
   ConflictItem,
   DaemonStatus,
   Device,
   DropTransfer,
   Folder,
+  FolderInvitation,
   FolderStatus,
   LocalBrowseEntry,
   LogEntry,
   NearbyPeer,
   PairRequest,
   PeerStatus,
+  SetupStatus,
   VersionItem,
   formatBytes,
+  invokeTauri,
+  isTauriRuntime,
 } from "./types";
 
+function isNetworkFailure(err: unknown): boolean {
+  if (err instanceof TypeError) return true;
+  const msg = String((err as any)?.message || "").toLowerCase();
+  return (
+    msg.includes("failed to fetch") ||
+    msg.includes("networkerror") ||
+    msg.includes("load failed") ||
+    msg.includes("http 502") ||
+    msg.includes("http 503") ||
+    msg.includes("http 504")
+  );
+}
+
 export default function App() {
+  const isDropMode = new URLSearchParams(window.location.search).get("mode") === "drop";
+
   const [tab, setTab] = useState<"sync" | "drop" | "devices" | "logs" | "settings">("sync");
+  const [setupStatus, setSetupStatus] = useState<SetupStatus | null>(null);
+  const [daemonOffline, setDaemonOffline] = useState(false);
+  const [stoppedByUser, setStoppedByUser] = useState(false);
+  const [offlineErr, setOfflineErr] = useState("");
+
   const [status, setStatus] = useState<DaemonStatus | null>(null);
   const [devices, setDevices] = useState<Device[]>([]);
   const [peerStatuses, setPeerStatuses] = useState<PeerStatus[]>([]);
@@ -32,8 +60,10 @@ export default function App() {
   const [pairRequests, setPairRequests] = useState<PairRequest[]>([]);
   const [folders, setFolders] = useState<Folder[]>([]);
   const [folderStatuses, setFolderStatuses] = useState<FolderStatus[]>([]);
+  const [folderInvitations, setFolderInvitations] = useState<FolderInvitation[]>([]);
   const [transfers, setTransfers] = useState<DropTransfer[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [companionApps, setCompanionApps] = useState<CompanionAppsInfo | null>(null);
   const [copiedID, setCopiedID] = useState(false);
   const [toast, setToast] = useState<{ text: string; kind: "ok" | "err" } | null>(null);
 
@@ -54,6 +84,9 @@ export default function App() {
     paused: false,
     ignore_patterns: "",
     peers: [],
+    min_free_disk_mb: 100,
+    trashcan_max_days: 30,
+    trashcan_max_mb: 0,
   });
 
   const [acceptAliasMap, setAcceptAliasMap] = useState<Record<string, string>>({});
@@ -69,11 +102,14 @@ export default function App() {
   const [cfgForm, setCfgForm] = useState<SettingsFormState>({
     node_name: "",
     relay_url: "",
+    relay_urls_text: "",
     auth_token: "",
     clear_auth_token: false,
     drop_inbox_dir: "",
     max_upload_kbps: 0,
     max_download_kbps: 0,
+    enable_upnp: true,
+    enable_compression: true,
     web_listen: "",
     web_tls: false,
     web_user: "",
@@ -83,6 +119,7 @@ export default function App() {
 
   const toastTimerRef = useRef<number | null>(null);
   const speedMapRef = useRef<Record<string, { ts: number; bytes: number; bps: number }>>({});
+  const notifiedOffersRef = useRef<Set<string>>(new Set());
   const [dropSpeedMap, setDropSpeedMap] = useState<Record<string, number>>({});
 
   const notify = useCallback((text: string, kind: "ok" | "err" = "ok") => {
@@ -100,6 +137,15 @@ export default function App() {
     const now = Date.now();
     const nextSpeeds: Record<string, number> = {};
     for (const t of list) {
+      if (t.direction === "receive" && t.status === "pending_accept" && !notifiedOffersRef.current.has(t.transfer_id)) {
+        notifiedOffersRef.current.add(t.transfer_id);
+        if (isTauriRuntime()) {
+          invokeTauri("send_native_notification", {
+            title: `QuickDrop de ${t.peer_name}`,
+            body: `${t.title} (${formatBytes(t.total_size)})`,
+          }).catch(() => {});
+        }
+      }
       if (t.status === "transferring") {
         const prev = speedMapRef.current[t.transfer_id];
         if (prev && now > prev.ts && t.transferred_bytes >= prev.bytes) {
@@ -122,7 +168,14 @@ export default function App() {
 
   const loadAll = useCallback(async () => {
     try {
-      const [st, devs, peers, nearby, reqs, flds, fsts, drops, logList] = await Promise.all([
+      const ss: SetupStatus = await apiFetch("/api/v1/setup/status");
+      setSetupStatus(ss);
+      if (ss.needs_setup && !ss.is_loopback) {
+        setDaemonOffline(false);
+        return;
+      }
+
+      const [st, devs, peers, nearby, reqs, flds, fsts, invs, drops, logList, comp] = await Promise.all([
         apiFetch("/api/v1/status"),
         apiFetch("/api/v1/devices"),
         apiFetch("/api/v1/peers"),
@@ -130,9 +183,14 @@ export default function App() {
         apiFetch("/api/v1/pair/requests"),
         apiFetch("/api/v1/folders"),
         apiFetch("/api/v1/folders/status"),
+        apiFetch("/api/v1/folder-invitations").catch(() => []),
         apiFetch("/api/v1/drop"),
         apiFetch("/api/v1/logs"),
+        apiFetch("/api/v1/companion-apps").catch(() => null),
       ]);
+      setDaemonOffline(false);
+      setStoppedByUser(false);
+      setOfflineErr("");
       setStatus(st);
       setDevices(devs || []);
       setPeerStatuses(peers || []);
@@ -140,23 +198,40 @@ export default function App() {
       setPairRequests(reqs || []);
       setFolders(flds || []);
       setFolderStatuses(fsts || []);
+      setFolderInvitations(invs || []);
       updateDropList(drops || []);
       setLogs(logList || []);
+      if (comp) setCompanionApps(comp);
       if (!cfgInitializedRef.current) {
         cfgInitializedRef.current = true;
         setCfgForm((prev) => ({
           ...prev,
           node_name: st.node_name || "",
           relay_url: st.relay_url || "",
+          relay_urls_text: (st.relay_urls || []).join("\n"),
           drop_inbox_dir: st.drop_inbox_dir || "",
           max_upload_kbps: st.max_upload_kbps || 0,
           max_download_kbps: st.max_download_kbps || 0,
+          enable_upnp: st.enable_upnp ?? true,
+          enable_compression: st.enable_compression ?? true,
           web_listen: st.web_listen || "",
           web_tls: !!st.web_tls,
           web_user: st.web_user || "",
         }));
       }
-    } catch (e) {
+    } catch (e: any) {
+      if (String(e?.message || "").includes("setup_required")) {
+        try {
+          const ss = await apiFetch("/api/v1/setup/status");
+          setSetupStatus(ss);
+        } catch {}
+        return;
+      }
+      if (isNetworkFailure(e)) {
+        setDaemonOffline(true);
+        setOfflineErr(e?.message || "Connexion interrompue");
+        return;
+      }
       console.error(e);
     }
   }, [updateDropList]);
@@ -174,6 +249,7 @@ export default function App() {
       ws = new WebSocket(`${proto}://${window.location.host}/api/v1/events`);
       ws.onopen = () => {
         backoffMs = 1000;
+        loadAll();
       };
       ws.onmessage = (ev) => {
         try {
@@ -185,6 +261,7 @@ export default function App() {
             loadAll();
           }
           if (msg.event === "folders_updated") setFolderStatuses(msg.data || []);
+          if (msg.event === "folder_invitations_updated") setFolderInvitations(msg.data || []);
           if (msg.event === "drop_updated") updateDropList(msg.data || []);
           if (msg.event === "log_entry" && msg.data) {
             setLogs((prev) => [...prev.slice(-499), msg.data]);
@@ -193,8 +270,11 @@ export default function App() {
       };
       ws.onclose = () => {
         if (stopped) return;
+        fetch("/api/v1/status", { method: "GET" }).catch(() => {
+          setDaemonOffline(true);
+        });
         reconnectTimer = window.setTimeout(connectWS, backoffMs);
-        backoffMs = Math.min(backoffMs * 2, 15000);
+        backoffMs = Math.min(backoffMs * 2, 10000);
       };
       ws.onerror = () => {
         ws?.close();
@@ -205,11 +285,22 @@ export default function App() {
       const detail = (ev as CustomEvent<string[]>).detail;
       if (Array.isArray(detail) && detail.length > 0) {
         setDropPaths((prev) => Array.from(new Set([...prev, ...detail])));
-        setTab("drop");
+        if (!isDropMode) setTab("drop");
         notify(`${detail.length} élément(s) local(aux) ajouté(s) en mode zéro-copie.`);
       }
     };
     window.addEventListener("gens-native-drop", onNativeDrop);
+    if (isTauriRuntime()) {
+      invokeTauri("take_pending_drop_paths")
+        .then((paths) => {
+          if (Array.isArray(paths) && paths.length > 0) {
+            setDropPaths((prev) => Array.from(new Set([...prev, ...(paths as string[])])));
+            if (!isDropMode) setTab("drop");
+            notify(`${paths.length} élément(s) sélectionné(s) depuis Windows.`);
+          }
+        })
+        .catch(() => {});
+    }
 
     connectWS();
     const timer = setInterval(loadAll, 20000);
@@ -220,7 +311,60 @@ export default function App() {
       ws?.close();
       clearInterval(timer);
     };
-  }, [loadAll, notify, updateDropList]);
+  }, [isDropMode, loadAll, notify, updateDropList]);
+
+  useEffect(() => {
+    if (!daemonOffline) return;
+    const probe = setInterval(() => {
+      loadAll();
+    }, 3000);
+    return () => clearInterval(probe);
+  }, [daemonOffline, loadAll]);
+
+  const stopDaemon = async () => {
+    setStoppedByUser(true);
+    try {
+      if (isTauriRuntime()) {
+        try {
+          await invokeTauri("stop_daemon_cmd");
+        } catch {
+          await apiFetch("/api/v1/shutdown", { method: "POST" });
+        }
+      } else {
+        await apiFetch("/api/v1/shutdown", { method: "POST" });
+      }
+    } catch (e: any) {
+      if (!isNetworkFailure(e)) {
+        setStoppedByUser(false);
+        notify(e?.message || "Impossible d'arrêter le daemon.", "err");
+        return;
+      }
+    }
+    setDaemonOffline(true);
+  };
+
+  const reconnectDaemon = async () => {
+    const res = await fetch("/api/v1/status");
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+    await loadAll();
+  };
+
+  const startDaemonFromTauri = async () => {
+    await invokeTauri("start_daemon");
+    for (let i = 0; i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 400));
+      try {
+        const res = await fetch("/api/v1/status");
+        if (res.ok) {
+          await loadAll();
+          return;
+        }
+      } catch {}
+    }
+    throw new Error("Le daemon met du temps à répondre — clique Reconnecter dans un instant.");
+  };
 
   const loadBrowse = async (p: string) => {
     try {
@@ -295,9 +439,29 @@ export default function App() {
   const saveSettings = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
+      const relayURLs = cfgForm.relay_urls_text
+        .split(/\r?\n/)
+        .map((s) => s.trim())
+        .filter(Boolean);
       const res = await apiFetch("/api/v1/config", {
         method: "POST",
-        body: JSON.stringify(cfgForm),
+        body: JSON.stringify({
+          node_name: cfgForm.node_name,
+          relay_url: cfgForm.relay_url,
+          relay_urls: relayURLs,
+          auth_token: cfgForm.auth_token,
+          clear_auth_token: cfgForm.clear_auth_token,
+          drop_inbox_dir: cfgForm.drop_inbox_dir,
+          max_upload_kbps: cfgForm.max_upload_kbps,
+          max_download_kbps: cfgForm.max_download_kbps,
+          enable_upnp: cfgForm.enable_upnp,
+          enable_compression: cfgForm.enable_compression,
+          web_listen: cfgForm.web_listen,
+          web_tls: cfgForm.web_tls,
+          web_user: cfgForm.web_user,
+          web_password: cfgForm.web_password,
+          clear_web_password: cfgForm.clear_web_password,
+        }),
       });
       cfgInitializedRef.current = false;
       setCfgForm((p) => ({
@@ -309,7 +473,7 @@ export default function App() {
       }));
       await loadAll();
       if (res?.needs_restart) {
-        notify("Configuration enregistrée (redémarrage du daemon requis pour appliquer l'écoute Web / HTTPS).");
+        notify("Configuration enregistrée (redémarrage du daemon requis pour appliquer l'écoute Web / HTTPS / UPnP).");
       } else {
         notify("Configuration enregistrée.");
       }
@@ -317,6 +481,57 @@ export default function App() {
       notify(err.message, "err");
     }
   };
+
+  if (daemonOffline) {
+    return (
+      <DaemonOfflineScreen
+        compact={isDropMode}
+        stoppedByUser={stoppedByUser}
+        lastError={offlineErr}
+        onReconnect={reconnectDaemon}
+        onStartDaemon={isTauriRuntime() ? startDaemonFromTauri : undefined}
+      />
+    );
+  }
+
+  if (setupStatus?.needs_setup && !setupStatus.is_loopback) {
+    return (
+      <SetupWizard
+        initialStatus={setupStatus}
+        onComplete={async () => {
+          window.location.reload();
+        }}
+      />
+    );
+  }
+
+  if (isDropMode) {
+    return (
+      <>
+        <CompactDropApp
+          status={status}
+          peerStatuses={peerStatuses}
+          transfers={transfers}
+          dropSpeedMap={dropSpeedMap}
+          dropPaths={dropPaths}
+          setDropPaths={setDropPaths}
+          companionApps={companionApps}
+          onReload={loadAll}
+          onStopDaemon={stopDaemon}
+          notify={notify}
+        />
+        {toast && (
+          <div
+            className={`fixed bottom-3 right-3 px-3 py-2 rounded-md shadow-xl text-xs font-medium z-50 border ${
+              toast.kind === "err" ? "bg-rose-950/95 border-rose-700 text-rose-100" : "bg-[#161a23] border-zinc-700 text-zinc-100"
+            }`}
+          >
+            {toast.text}
+          </div>
+        )}
+      </>
+    );
+  }
 
   const connectedPeers = peerStatuses.filter((p) => p.connected);
   const pendingIncomingDrops = transfers.filter((t) => t.direction === "receive" && t.status === "pending_accept");
@@ -364,7 +579,11 @@ export default function App() {
           <div className="flex items-center gap-2 text-xs">
             <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-[#161a23] border border-zinc-800 text-zinc-300">
               <span className={`w-1.5 h-1.5 rounded-full ${status?.relay_connected ? "bg-emerald-400" : "bg-zinc-500"}`} />
-              {status?.relay_url ? (status.relay_connected ? "Relais en ligne" : "Relais hors ligne") : "LAN direct"}
+              {status?.relay_url || (status?.relay_urls?.length || 0) > 0
+                ? status?.relay_connected
+                  ? "Relais en ligne"
+                  : "Relais hors ligne"
+                : "LAN direct"}
             </span>
             <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-[#161a23] border border-zinc-800 text-zinc-300">
               <span className={`w-1.5 h-1.5 rounded-full ${connectedPeers.length > 0 ? "bg-blue-400" : "bg-zinc-600"}`} />
@@ -377,7 +596,7 @@ export default function App() {
       <div className="flex-1 flex flex-col md:flex-row min-h-0">
         <aside className="md:w-56 border-b md:border-b-0 md:border-r border-zinc-800/90 bg-[#0e1117] p-3 flex md:flex-col gap-1 shrink-0 overflow-x-auto">
           {[
-            { id: "sync", label: "Synchronisation", icon: FolderSync, badge: totalNeedFiles },
+            { id: "sync", label: "Synchronisation", icon: FolderSync, badge: totalNeedFiles + folderInvitations.length },
             { id: "drop", label: "QuickDrop", icon: Send, badge: pendingIncomingDrops.length },
             { id: "devices", label: "Appareils", icon: Server, badge: incomingRequests.length },
             { id: "logs", label: "Activité", icon: Terminal, badge: 0 },
@@ -507,8 +726,10 @@ export default function App() {
           <main className="p-6 max-w-6xl w-full mx-auto space-y-6">
             {tab === "sync" && (
               <SyncTab
+                status={status}
                 folders={folders}
                 folderStatusMap={folderStatusMap}
+                invitations={folderInvitations}
                 devices={devices}
                 peerStatusMap={peerStatusMap}
                 totalLocalFiles={totalLocalFiles}
@@ -527,6 +748,9 @@ export default function App() {
                     paused: false,
                     ignore_patterns: "",
                     peers: [],
+                    min_free_disk_mb: 100,
+                    trashcan_max_days: 30,
+                    trashcan_max_mb: 0,
                   });
                   setShowFolderModal(true);
                 }}
@@ -544,7 +768,7 @@ export default function App() {
             {tab === "drop" && (
               <DropTab
                 status={status}
-                connectedPeers={connectedPeers}
+                peerStatuses={peerStatuses}
                 transfers={transfers}
                 dropSpeedMap={dropSpeedMap}
                 dropPaths={dropPaths}
@@ -575,8 +799,11 @@ export default function App() {
                 status={status}
                 cfgForm={cfgForm}
                 setCfgForm={setCfgForm}
+                companionApps={companionApps}
                 onOpenInboxPicker={() => openPicker("inbox", cfgForm.drop_inbox_dir)}
                 onSave={saveSettings}
+                onStopDaemon={stopDaemon}
+                notify={notify}
               />
             )}
           </main>

@@ -15,20 +15,57 @@ import (
 )
 
 type Settings struct {
-	NodeName        string `json:"node_name"`
-	RelayURL        string `json:"relay_url"`
-	AuthToken       string `json:"auth_token"`
-	QUICPort        int    `json:"quic_port"`
-	DiscoveryPort   int    `json:"discovery_port"`
-	EnableLANDisc   bool   `json:"enable_lan_discovery"`
-	EnableRelayFall bool   `json:"enable_relay_fallback"`
-	WebListen       string `json:"web_listen"`
-	WebTLS          bool   `json:"web_tls"`
-	WebUser         string `json:"web_user"`
-	WebPassHash     string `json:"web_pass_hash,omitempty"`
-	DropInboxDir    string `json:"drop_inbox_dir"`
-	MaxUploadKBps   int    `json:"max_upload_kbps"`   // 0 = unlimited
-	MaxDownloadKBps int    `json:"max_download_kbps"` // 0 = unlimited
+	NodeName          string   `json:"node_name"`
+	RelayURL          string   `json:"relay_url,omitempty"`
+	RelayURLs         []string `json:"relay_urls,omitempty"`
+	AuthToken         string   `json:"auth_token"`
+	QUICPort          int      `json:"quic_port"`
+	DiscoveryPort     int      `json:"discovery_port"`
+	EnableLANDisc     bool     `json:"enable_lan_discovery"`
+	EnableRelayFall   bool     `json:"enable_relay_fallback"`
+	EnableUPnP        bool     `json:"enable_upnp"`
+	EnableCompression bool     `json:"enable_compression"`
+	WebListen         string   `json:"web_listen"`
+	WebTLS            bool     `json:"web_tls"`
+	WebUser           string   `json:"web_user"`
+	WebPassHash       string   `json:"web_pass_hash,omitempty"`
+	DropInboxDir      string   `json:"drop_inbox_dir"`
+	MaxUploadKBps     int      `json:"max_upload_kbps"`   // 0 = unlimited
+	MaxDownloadKBps   int      `json:"max_download_kbps"` // 0 = unlimited
+}
+
+// EffectiveRelayURLs returns the normalized deduplicated list of configured relay URLs.
+func (s Settings) EffectiveRelayURLs() []string {
+	seen := make(map[string]struct{})
+	var out []string
+	add := func(raw string) {
+		u := normalizeRelayURL(raw)
+		if u == "" {
+			return
+		}
+		if _, ok := seen[u]; !ok {
+			seen[u] = struct{}{}
+			out = append(out, u)
+		}
+	}
+	for _, r := range s.RelayURLs {
+		add(r)
+	}
+	if s.RelayURL != "" {
+		add(s.RelayURL)
+	}
+	return out
+}
+
+func normalizeRelayURL(raw string) string {
+	u := strings.TrimSpace(raw)
+	if u == "" {
+		return ""
+	}
+	if !strings.Contains(u, "://") {
+		u = "ws://" + u
+	}
+	return u
 }
 
 type DaemonConfig struct {
@@ -72,15 +109,17 @@ func LoadOrCreateDaemonConfig(dataDir string) (*DaemonConfig, error) {
 
 	cfg := &DaemonConfig{
 		Settings: Settings{
-			NodeName:        hostname,
-			RelayURL:        envOr("RELAY_URL", ""),
-			AuthToken:       envOr("AUTH_TOKEN", ""),
-			QUICPort:        22000,
-			DiscoveryPort:   21027,
-			EnableLANDisc:   true,
-			EnableRelayFall: true,
-			WebListen:       envOr("GENS_WEB_LISTEN", "127.0.0.1:8385"),
-			DropInboxDir:    DefaultDropInbox(dataDir),
+			NodeName:          hostname,
+			RelayURL:          envOr("RELAY_URL", ""),
+			AuthToken:         envOr("AUTH_TOKEN", ""),
+			QUICPort:          22000,
+			DiscoveryPort:     21027,
+			EnableLANDisc:     true,
+			EnableRelayFall:   true,
+			EnableUPnP:        true,
+			EnableCompression: true,
+			WebListen:         envOr("GENS_WEB_LISTEN", "127.0.0.1:8385"),
+			DropInboxDir:      DefaultDropInbox(dataDir),
 		},
 		filePath: cfgPath,
 	}
@@ -97,9 +136,26 @@ func LoadOrCreateDaemonConfig(dataDir string) (*DaemonConfig, error) {
 	if v := os.Getenv("NODE_NAME"); v != "" {
 		cfg.NodeName = v
 	}
-	if v := os.Getenv("RELAY_URL"); v != "" {
-		cfg.RelayURL = v
+	if v := os.Getenv("GENS_RELAY_URLS"); v != "" {
+		var list []string
+		for _, part := range strings.Split(v, ",") {
+			if n := normalizeRelayURL(part); n != "" {
+				list = append(list, n)
+			}
+		}
+		cfg.RelayURLs = list
+		if len(list) > 0 {
+			cfg.RelayURL = list[0]
+		} else {
+			cfg.RelayURL = ""
+		}
+	} else if v := os.Getenv("RELAY_URL"); v != "" {
+		norm := normalizeRelayURL(v)
+		cfg.RelayURL = norm
+		cfg.RelayURLs = append([]string{norm}, cfg.RelayURLs...)
 	}
+	cfg.syncRelayFieldsLocked()
+
 	if v := os.Getenv("AUTH_TOKEN"); v != "" {
 		cfg.AuthToken = v
 	}
@@ -109,15 +165,32 @@ func LoadOrCreateDaemonConfig(dataDir string) (*DaemonConfig, error) {
 	if v := os.Getenv("GENS_WEB_TLS"); v == "true" || v == "1" {
 		cfg.WebTLS = true
 	}
+	if v := os.Getenv("GENS_WEB_USER"); v != "" {
+		cfg.WebUser = v
+	}
 	if v := os.Getenv("GENS_DROP_INBOX"); v != "" {
 		cfg.DropInboxDir = v
 	}
 
 	_ = os.MkdirAll(cfg.DropInboxDir, 0755)
-	if err := cfg.Save(); err != nil {
+	if v := os.Getenv("GENS_WEB_PASS"); v != "" && cfg.WebPassHash == "" {
+		if err := cfg.SetWebPassword(v); err != nil {
+			return nil, err
+		}
+	} else if err := cfg.Save(); err != nil {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+func (c *DaemonConfig) syncRelayFieldsLocked() {
+	urls := c.Settings.EffectiveRelayURLs()
+	c.RelayURLs = urls
+	if len(urls) > 0 {
+		c.RelayURL = urls[0]
+	} else {
+		c.RelayURL = ""
+	}
 }
 
 func (c *DaemonConfig) DataDir() string {
@@ -142,12 +215,17 @@ func (c *DaemonConfig) Save() error {
 func (c *DaemonConfig) Snapshot() Settings {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.Settings
+	cp := c.Settings
+	if len(c.Settings.RelayURLs) > 0 {
+		cp.RelayURLs = append([]string(nil), c.Settings.RelayURLs...)
+	}
+	return cp
 }
 
 func (c *DaemonConfig) Update(fn func(*DaemonConfig)) error {
 	c.mu.Lock()
 	fn(c)
+	c.syncRelayFieldsLocked()
 	c.mu.Unlock()
 	return c.Save()
 }
@@ -239,8 +317,9 @@ func CleanupOrphanedTemps(root string, activeTransferIDs ...map[string]struct{})
 	})
 }
 
-// CleanupOrphanedStaging removes stale browser upload staging directories older than 30 minutes.
-func CleanupOrphanedStaging(stagingRoots ...string) {
+// CleanupOrphanedStaging removes stale browser upload staging directories older than 30 minutes,
+// preserving any directory referenced by active/paused/queued transfers.
+func CleanupOrphanedStaging(activeStaging map[string]struct{}, stagingRoots ...string) {
 	cutoff := time.Now().Add(-30 * time.Minute)
 	for _, root := range stagingRoots {
 		if root == "" {
@@ -254,8 +333,14 @@ func CleanupOrphanedStaging(stagingRoots ...string) {
 			if !e.IsDir() {
 				continue
 			}
+			full := filepath.Join(root, e.Name())
+			if activeStaging != nil {
+				if _, keep := activeStaging[filepath.Clean(full)]; keep {
+					continue
+				}
+			}
 			if info, err := e.Info(); err == nil && info.ModTime().Before(cutoff) {
-				_ = os.RemoveAll(filepath.Join(root, e.Name()))
+				_ = os.RemoveAll(full)
 			}
 		}
 	}

@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -258,5 +259,183 @@ func TestQuickDropFolderMultipartUploadEndToEnd(t *testing.T) {
 	if err != nil || string(outBytes) != "nested-folder-upload-ok" {
 		log.Printf("inbox dir=%s", rCfg.Snapshot().DropInboxDir)
 		t.Fatalf("expected nested folder file on receiver, got %q err=%v", string(outBytes), err)
+	}
+}
+
+func TestWebAPISetupWizardRateLimitInvitationsAndOfflineUpload(t *testing.T) {
+	dir := t.TempDir()
+	cfg, err := config.LoadOrCreateDaemonConfig(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := protocol.LoadOrCreateIdentity(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	pMgr := p2p.NewManager(id, cfg, st, p2p.Handlers{})
+	sMgr := syncer.NewManager(id.DeviceID, st, pMgr, nil)
+	dMgr := drop.NewManager(cfg, st, pMgr, nil)
+	apiSrv := NewServer(id, cfg, st, pMgr, sMgr, dMgr, nil)
+	h := apiSrv.Handler()
+
+	// 1. Loopback works without password prior to setup
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	req.RemoteAddr = "127.0.0.1:41000"
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected loopback status 200 before setup, got %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	// 2. Non-loopback API requests return 403 setup_required before password set
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	req.RemoteAddr = "198.51.100.42:55000"
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "setup_required") {
+		t.Fatalf("expected 403 setup_required for remote request, got %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	// Check /api/v1/setup/status
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/setup/status", nil)
+	req.RemoteAddr = "198.51.100.42:55000"
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"needs_setup":true`) {
+		t.Fatalf("expected setup status needs_setup=true, got %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	// Non-loopback cannot call /api/v1/open-path even after setup; check before & after
+	inboxDir := filepath.Join(dir, "inbox")
+	setupPayload := fmt.Sprintf(`{"web_user":"admin","web_password":"secret-password-99","node_name":"TrueNASBox","drop_inbox_dir":%q}`, inboxDir)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/setup", strings.NewReader(setupPayload))
+	req.RemoteAddr = "198.51.100.42:55000"
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST /api/v1/setup failed: %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	// 3. Re-running setup returns 409 Conflict
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/setup", strings.NewReader(setupPayload))
+	req.RemoteAddr = "127.0.0.1:41000"
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 on repeat setup, got %d", rec.Code)
+	}
+
+	// 4. Rate limit Basic Auth (5 failures -> 429 on 6th)
+	for i := 0; i < 5; i++ {
+		req = httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+		req.RemoteAddr = "198.51.100.42:55000"
+		req.SetBasicAuth("admin", "wrong-pass")
+		rec = httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: expected 401, got %d", i+1, rec.Code)
+		}
+	}
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	req.RemoteAddr = "198.51.100.42:55000"
+	req.SetBasicAuth("admin", "secret-password-99")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 rate limit on 6th request, got %d", rec.Code)
+	}
+
+	// Valid auth from another IP works
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	req.RemoteAddr = "127.0.0.1:41000"
+	req.SetBasicAuth("admin", "secret-password-99")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 with valid auth, got %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	// 5. Loopback restriction on /api/v1/open-path
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/open-path", strings.NewReader(`{"path":".","reveal":false}`))
+	req.RemoteAddr = "198.51.100.99:55000"
+	req.SetBasicAuth("admin", "secret-password-99")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for non-loopback open-path, got %d", rec.Code)
+	}
+
+	// 6. Companion apps endpoint
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/companion-apps", nil)
+	req.RemoteAddr = "127.0.0.1:41000"
+	req.SetBasicAuth("admin", "secret-password-99")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"desktop_installed"`) {
+		t.Fatalf("unexpected companion-apps response: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// 7. Folder invitations CRUD via API
+	senderID := "GENS-0000-0000-0000-0000-0000-0000-0002"
+	_ = st.UpsertDevice(store.DeviceRecord{DeviceID: senderID, Name: "PeerTwo"})
+	_ = st.UpsertFolderInvitation(store.FolderInvitationRecord{
+		FolderID:   "shared-docs",
+		Label:      "Shared Docs",
+		SenderID:   senderID,
+		SenderName: "PeerTwo",
+	})
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/folder-invitations", nil)
+	req.RemoteAddr = "127.0.0.1:41000"
+	req.SetBasicAuth("admin", "secret-password-99")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"shared-docs"`) {
+		t.Fatalf("expected shared-docs invitation, got %d %s", rec.Code, rec.Body.String())
+	}
+	acceptDir := filepath.Join(dir, "accepted-share")
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/folder-invitations/shared-docs/accept",
+		strings.NewReader(fmt.Sprintf(`{"sender_id":%q,"local_path":%q,"mode":"send_receive"}`, senderID, acceptDir)))
+	req.RemoteAddr = "127.0.0.1:41000"
+	req.SetBasicAuth("admin", "secret-password-99")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("accept invitation failed: %d %s", rec.Code, rec.Body.String())
+	}
+	fRec, err := st.GetFolder("shared-docs")
+	if err != nil || fRec.LocalPath != acceptDir {
+		t.Fatalf("expected accepted folder in store, got %+v err=%v", fRec, err)
+	}
+
+	// 8. Inline prehashed multipart upload to offline peer -> queued_offline
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	_ = mw.WriteField("peer_id", senderID)
+	_ = mw.WriteField("rel_path", "Inline/stream.txt")
+	fw, _ := mw.CreateFormFile("files", "stream.txt")
+	_, _ = fw.Write([]byte("inline-stream-hashed-payload"))
+	_ = mw.Close()
+
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/drop/upload", &body)
+	req.RemoteAddr = "127.0.0.1:41000"
+	req.SetBasicAuth("admin", "secret-password-99")
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("upload failed: %d %s", rec.Code, rec.Body.String())
+	}
+	var upRec store.DropTransferRecord
+	if err := json.Unmarshal(rec.Body.Bytes(), &upRec); err != nil {
+		t.Fatal(err)
+	}
+	if upRec.Status != "queued_offline" || len(upRec.Files) != 1 || upRec.Files[0].FileHash == "" {
+		t.Fatalf("unexpected inline prehashed upload result: %+v", upRec)
 	}
 }

@@ -35,4 +35,15 @@ func TestIdentityPersistenceAndChallenge(t *testing.T) {
 	if err := VerifyChallenge("AAAA-BBBB-CCCC-DDDD", id1.PubKeyDER, challenge, sig); err == nil {
 		t.Fatal("expected mismatched DeviceID to fail verification")
 	}
+
+	proof := ComputeAuthProof("net-secret", challenge)
+	if !VerifyAuthProof("net-secret", challenge, proof) {
+		t.Fatal("expected valid HMAC auth proof to pass")
+	}
+	if VerifyAuthProof("wrong-secret", challenge, proof) {
+		t.Fatal("expected wrong token to fail HMAC verification")
+	}
+	if VerifyAuthProof("net-secret", []byte("other-nonce"), proof) {
+		t.Fatal("expected wrong nonce to fail HMAC verification")
+	}
 }

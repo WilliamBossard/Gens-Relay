@@ -112,6 +112,42 @@ export function FolderModal({ show, editing, fForm, setFForm, devices, onClose, 
           </div>
         </div>
 
+        <div className="grid sm:grid-cols-3 gap-3">
+          <div>
+            <label className="block text-xs text-zinc-400 mb-1">Espace libre min. (Mo)</label>
+            <input
+              type="number"
+              min={0}
+              value={fForm.min_free_disk_mb ?? 100}
+              onChange={(e) => setFForm({ ...fForm, min_free_disk_mb: Number(e.target.value) })}
+              className="w-full bg-[#0b0d11] border border-zinc-700 rounded-md px-2 py-1.5 text-xs"
+              title="Stoppe les téléchargements si le disque passe sous ce seuil"
+            />
+          </div>
+          <div>
+            <label className="block text-xs text-zinc-400 mb-1">Rétention corbeille (j)</label>
+            <input
+              type="number"
+              min={0}
+              value={fForm.trashcan_max_days ?? 30}
+              onChange={(e) => setFForm({ ...fForm, trashcan_max_days: Number(e.target.value) })}
+              className="w-full bg-[#0b0d11] border border-zinc-700 rounded-md px-2 py-1.5 text-xs"
+              title="0 = illimité"
+            />
+          </div>
+          <div>
+            <label className="block text-xs text-zinc-400 mb-1">Quota corbeille (Mo)</label>
+            <input
+              type="number"
+              min={0}
+              value={fForm.trashcan_max_mb ?? 0}
+              onChange={(e) => setFForm({ ...fForm, trashcan_max_mb: Number(e.target.value) })}
+              className="w-full bg-[#0b0d11] border border-zinc-700 rounded-md px-2 py-1.5 text-xs"
+              title="0 = illimité"
+            />
+          </div>
+        </div>
+
         <div>
           <label className="block text-xs text-zinc-400 mb-1">Appareils autorisés sur ce dossier</label>
           <div className="flex flex-wrap gap-2 bg-[#0b0d11] border border-zinc-800 rounded-md p-2.5">

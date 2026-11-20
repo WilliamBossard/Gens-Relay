@@ -29,6 +29,9 @@ test-node*/
 desktop/src-tauri/target/
 desktop/src-tauri/gen/
 desktop/src-tauri/binaries/
+drop-desktop/src-tauri/target/
+drop-desktop/src-tauri/gen/
+drop-desktop/src-tauri/binaries/
 relay-desktop/src-tauri/target/
 relay-desktop/src-tauri/gen/
 relay-desktop/src-tauri/binaries/

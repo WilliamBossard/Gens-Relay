@@ -3,6 +3,7 @@ package syncer
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -54,7 +55,7 @@ func TestIgnoreMatcherAndVectorClock(t *testing.T) {
 	}
 }
 
-func TestVersionerTrashcanAndSimple(t *testing.T) {
+func TestVersionerTrashcanSimpleAndPrune(t *testing.T) {
 	dir := t.TempDir()
 	sub := filepath.Join(dir, "docs")
 	_ = os.MkdirAll(sub, 0755)
@@ -71,6 +72,15 @@ func TestVersionerTrashcanAndSimple(t *testing.T) {
 		t.Fatalf("expected file in .gensversions, got %q err=%v", string(data), err)
 	}
 
+	// Age-based pruning removes old trashcan files
+	oldFile := filepath.Join(dir, ".gensversions", "docs", "note.txt")
+	past := time.Now().Add(-40 * 24 * time.Hour)
+	_ = os.Chtimes(oldFile, past, past)
+	PruneTrashcan(dir, 30, 0)
+	if _, err := os.Stat(oldFile); !os.IsNotExist(err) {
+		t.Fatalf("expected old trashcan file pruned")
+	}
+
 	// Directory archiving in trashcan mode must preserve nested files in .gensversions
 	tree := filepath.Join(dir, "folder_del", "inner")
 	_ = os.MkdirAll(tree, 0755)
@@ -84,7 +94,7 @@ func TestVersionerTrashcanAndSimple(t *testing.T) {
 	}
 }
 
-func TestScanFolderMountGuardAndIgnoredPurge(t *testing.T) {
+func TestScanFolderMountGuardIgnoredPurgeAndIncrementalScanPaths(t *testing.T) {
 	dir := t.TempDir()
 	_ = os.WriteFile(filepath.Join(dir, "keep.txt"), []byte("hello"), 0644)
 	_ = os.WriteFile(filepath.Join(dir, "temp.tmp"), []byte("junk"), 0644)
@@ -102,6 +112,33 @@ func TestScanFolderMountGuardAndIgnoredPurge(t *testing.T) {
 		prev[f.RelPath] = f
 	}
 
+	// Incremental ScanPaths detects new/modified/deleted files without full walk
+	_ = os.MkdirAll(filepath.Join(dir, "sub"), 0755)
+	_ = os.WriteFile(filepath.Join(dir, "sub", "inc.txt"), []byte("incremental-ok"), 0644)
+	incRes, err := ScanPaths(dir, "NODE-A", "", []string{"sub/inc.txt"}, prev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(incRes.Changed) != 1 || incRes.Changed[0].RelPath != "sub/inc.txt" || incRes.FileCount != 3 {
+		t.Fatalf("unexpected ScanPaths result: %+v", incRes)
+	}
+	prev["sub/inc.txt"] = incRes.Changed[0]
+
+	// Case collision detection helper
+	collisions := DetectCaseCollisions(map[string]protocol.FileMetadata{
+		"Docs/Note.txt": {RelPath: "Docs/Note.txt"},
+		"docs/note.txt": {RelPath: "docs/note.txt"},
+	})
+	if len(collisions) != 2 {
+		t.Fatalf("expected 2 case-colliding entries, got %+v", collisions)
+	}
+
+	// Free disk check
+	avail, err := AvailableDiskBytes(dir)
+	if err != nil || avail == 0 {
+		t.Fatalf("AvailableDiskBytes failed: avail=%d err=%v", avail, err)
+	}
+
 	// Simulate adding *.tmp to .gensignore -> temp.tmp must be reported in IgnoredRelPaths, not Deleted
 	res2, err := ScanFolder(dir, "NODE-A", "*.tmp", prev)
 	if err != nil {
@@ -117,11 +154,72 @@ func TestScanFolderMountGuardAndIgnoredPurge(t *testing.T) {
 	}
 
 	// Simulate unmounted drive: remove all entries including .gensfolder while prev has live files
+	_ = os.RemoveAll(filepath.Join(dir, "sub"))
 	_ = os.Remove(filepath.Join(dir, "keep.txt"))
 	_ = os.Remove(filepath.Join(dir, "temp.tmp"))
 	_ = os.Remove(filepath.Join(dir, FolderMarkerName))
 	if _, err := ScanFolder(dir, "NODE-A", "", prev); err == nil {
 		t.Fatal("expected ScanFolder to abort when .gensfolder marker is missing in empty directory")
+	}
+}
+
+func TestFolderInvitationsAndRevertReceiveOnlyExtras(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	dir := t.TempDir()
+	cfg, _ := config.LoadOrCreateDaemonConfig(dir)
+	_ = cfg.Update(func(c *config.DaemonConfig) {
+		c.QUICPort = 0
+		c.EnableLANDisc = false
+		c.EnableUPnP = false
+	})
+	id, _ := protocol.LoadOrCreateIdentity(dir)
+	st, _ := store.Open(dir)
+	defer st.Close()
+	pMgr := p2p.NewManager(id, cfg, st, p2p.Handlers{})
+	sMgr := NewManager(id.DeviceID, st, pMgr, nil)
+
+	_ = st.UpsertDevice(store.DeviceRecord{DeviceID: "PEER-1", Name: "SenderPeer"})
+
+	// Incoming shared folder invitation
+	invRaw, _ := json.Marshal(protocol.FolderInviteMsg{
+		FolderID:      "photos",
+		Label:         "Photos Famille",
+		SuggestedMode: "receive_only",
+		FileCount:     12,
+		TotalBytes:    4096,
+	})
+	sMgr.HandleFolderInvite("PEER-1", invRaw)
+	invs, err := st.ListFolderInvitations()
+	if err != nil || len(invs) != 1 || invs[0].Label != "Photos Famille" {
+		t.Fatalf("expected folder invitation saved, got %+v err=%v", invs, err)
+	}
+
+	targetDir := filepath.Join(t.TempDir(), "photos-local")
+	if err := sMgr.AcceptInvitation("photos", "PEER-1", targetDir, protocol.ModeReceiveOnly); err != nil {
+		t.Fatal(err)
+	}
+	invsAfter, _ := st.ListFolderInvitations()
+	if len(invsAfter) != 0 {
+		t.Fatalf("expected invitation removed after accept")
+	}
+
+	// Extra file created locally in receive_only must be archived & removed on RevertLocalChanges
+	extraFile := filepath.Join(targetDir, "rogue.txt")
+	_ = os.WriteFile(extraFile, []byte("rogue"), 0644)
+	_ = st.UpsertLocalFiles("photos", []protocol.FileMetadata{
+		{RelPath: "rogue.txt", Size: 5, Version: protocol.VectorClock{id.DeviceID: 1}},
+	})
+	if err := sMgr.RevertLocalChanges(ctx, "photos"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(extraFile); !os.IsNotExist(err) {
+		t.Fatalf("expected extra receive_only file archived on RevertLocalChanges")
+	}
+	archived := filepath.Join(targetDir, ".gensversions", "rogue.txt")
+	if _, err := os.Stat(archived); err != nil {
+		t.Fatalf("expected reverted extra file preserved in .gensversions: %v", err)
 	}
 }
 
@@ -132,7 +230,6 @@ func TestEndToEndP2PSyncBidirectionalAndUnidirectional(t *testing.T) {
 	nodeA := newTestNode(t, ctx, "WinNode")
 	nodeB := newTestNode(t, ctx, "NASNode")
 
-	// Pair A <-> B
 	if err := nodeA.store.UpsertDevice(store.DeviceRecord{DeviceID: nodeB.id.DeviceID, Name: "NAS"}); err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +242,6 @@ func TestEndToEndP2PSyncBidirectionalAndUnidirectional(t *testing.T) {
 	_ = os.MkdirAll(dirA, 0755)
 	_ = os.MkdirAll(dirB, 0755)
 
-	// Configure FolderID "shared-docs": SendOnly on A -> ReceiveOnly on B
 	if err := nodeA.store.UpsertFolder(store.FolderRecord{
 		FolderID:  "shared-docs",
 		Label:     "Shared Docs",
@@ -166,7 +262,6 @@ func TestEndToEndP2PSyncBidirectionalAndUnidirectional(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Write a 1.2 MiB file (multi-block) on A
 	bigData := bytes.Repeat([]byte("GENS-SYNC-BLOCK-"), 80000)
 	_ = os.MkdirAll(filepath.Join(dirA, "sub"), 0755)
 	_ = os.WriteFile(filepath.Join(dirA, "sub", "archive.bin"), bigData, 0644)
@@ -174,7 +269,6 @@ func TestEndToEndP2PSyncBidirectionalAndUnidirectional(t *testing.T) {
 	nodeA.sync.Start(ctx)
 	nodeB.sync.Start(ctx)
 
-	// Connect A -> B over localhost QUIC mTLS
 	nodeA.p2p.SetPeerEndpoint(nodeB.id.DeviceID, "NAS", fmt.Sprintf("127.0.0.1:%d", nodeB.p2p.QUICPort()))
 
 	targetFile := filepath.Join(dirB, "sub", "archive.bin")
@@ -187,11 +281,22 @@ func TestEndToEndP2PSyncBidirectionalAndUnidirectional(t *testing.T) {
 	_ = os.Remove(filepath.Join(dirA, "sub", "archive.bin"))
 	nodeA.sync.TriggerScan("shared-docs")
 
-	waitUntil(t, 12*time.Second, func() bool {
+	deadline := time.Now().Add(12 * time.Second)
+	for time.Now().Before(deadline) {
 		_, errOrig := os.Stat(targetFile)
 		_, errTrash := os.Stat(filepath.Join(dirB, ".gensversions", "sub", "archive.bin"))
-		return os.IsNotExist(errOrig) && errTrash == nil
-	}, "expected deletion on A to trashcan file on B")
+		if os.IsNotExist(errOrig) && errTrash == nil {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	_, errOrig := os.Stat(targetFile)
+	_, errTrash := os.Stat(filepath.Join(dirB, ".gensversions", "sub", "archive.bin"))
+	aLoc, _ := nodeA.store.GetLocalIndex("shared-docs")
+	bRem, _ := nodeB.store.GetRemoteIndex("shared-docs", nodeA.id.DeviceID)
+	bLoc, _ := nodeB.store.GetLocalIndex("shared-docs")
+	t.Fatalf("timeout waiting for trashcan deletion: errOrig=%v errTrash=%v aLoc=%+v bRem=%+v bLoc=%+v",
+		errOrig, errTrash, aLoc["sub/archive.bin"], bRem["sub/archive.bin"], bLoc["sub/archive.bin"])
 }
 
 func TestEndToEndBidirectionalConflictResolution(t *testing.T) {
@@ -224,7 +329,6 @@ func TestEndToEndBidirectionalConflictResolution(t *testing.T) {
 		Peers:     []string{nodeA.id.DeviceID},
 	})
 
-	// Both create the same file while disconnected with slightly different mtimes
 	_ = os.WriteFile(filepath.Join(dirA, "notes.txt"), []byte("version-from-A"), 0644)
 	oldTime := time.Now().Add(-1 * time.Hour)
 	_ = os.Chtimes(filepath.Join(dirA, "notes.txt"), oldTime, oldTime)
@@ -234,7 +338,6 @@ func TestEndToEndBidirectionalConflictResolution(t *testing.T) {
 	nodeA.sync.Start(ctx)
 	nodeB.sync.Start(ctx)
 
-	// Wait for initial local scans before connecting
 	waitUntil(t, 5*time.Second, func() bool {
 		idxA, _ := nodeA.store.GetLocalIndex("bidir")
 		idxB, _ := nodeB.store.GetLocalIndex("bidir")
@@ -243,7 +346,6 @@ func TestEndToEndBidirectionalConflictResolution(t *testing.T) {
 
 	nodeA.p2p.SetPeerEndpoint(nodeB.id.DeviceID, "Ubuntu", fmt.Sprintf("127.0.0.1:%d", nodeB.p2p.QUICPort()))
 
-	// Newer version (B) must win at notes.txt on both nodes, and A's loser must be saved as *.sync-conflict-*
 	waitUntil(t, 12*time.Second, func() bool {
 		aData, errA := os.ReadFile(filepath.Join(dirA, "notes.txt"))
 		bData, errB := os.ReadFile(filepath.Join(dirB, "notes.txt"))
@@ -276,6 +378,7 @@ func newTestNode(t *testing.T, ctx context.Context, name string) *testNode {
 		c.NodeName = name
 		c.QUICPort = 0
 		c.EnableLANDisc = false
+		c.EnableUPnP = false
 		c.RelayURL = ""
 	})
 	id, err := protocol.LoadOrCreateIdentity(dataDir)
@@ -310,6 +413,12 @@ func newTestNode(t *testing.T, ctx context.Context, name string) *testNode {
 	if err := pMgr.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		shutCtx, shutCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer shutCancel()
+		sMgr.Shutdown(shutCtx)
+		pMgr.Shutdown(shutCtx)
+	})
 	return &testNode{id: id, store: st, p2p: pMgr, sync: sMgr}
 }
 

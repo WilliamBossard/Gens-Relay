@@ -24,6 +24,7 @@ type RelayStatus = {
   listen_addr: string;
   admin_listen: string;
   stun_port: number;
+  udp_relay_port?: number;
   online_devices: number;
   active_pair_codes: number;
   pending_queues: number;
@@ -36,7 +37,16 @@ type RelayStatus = {
   max_clients: number;
   relay_packets_total: number;
   relay_bytes_total: number;
+  udp_relay_bytes_total?: number;
+  ws_relay_bytes_total?: number;
   relay_bps: number;
+};
+
+type SetupStatus = {
+  needs_setup: boolean;
+  is_local: boolean;
+  requires_setup_token: boolean;
+  admin_user?: string;
 };
 
 type ConnectedClient = {
@@ -49,6 +59,7 @@ type ConnectedClient = {
   relay_rx_bytes: number;
   relay_tx_bytes: number;
   watching_count: number;
+  udp_relay?: boolean;
 };
 
 type PairCodeInfo = {
@@ -118,6 +129,17 @@ function resolveApiBase(): string {
 
 export default function App() {
   const [tab, setTab] = useState<"overview" | "clients" | "pairing" | "logs" | "settings">("overview");
+  const [setupStatus, setSetupStatus] = useState<SetupStatus | null>(null);
+  const [setupUser, setSetupUser] = useState("admin");
+  const [setupPass, setSetupPass] = useState("");
+  const [setupPassConfirm, setSetupPassConfirm] = useState("");
+  const [setupToken, setSetupToken] = useState("");
+  const [setupAuthToken, setSetupAuthToken] = useState("");
+  const [setupBlindRelay, setSetupBlindRelay] = useState(true);
+  const [setupMaxKBps, setSetupMaxKBps] = useState(0);
+  const [setupErr, setSetupErr] = useState("");
+  const [setupBusy, setSetupBusy] = useState(false);
+
   const [status, setStatus] = useState<RelayStatus | null>(null);
   const [clients, setClients] = useState<ConnectedClient[]>([]);
   const [pairCodes, setPairCodes] = useState<PairCodeInfo[]>([]);
@@ -127,6 +149,7 @@ export default function App() {
   const [logFilter, setLogFilter] = useState("");
   const [bpsHistory, setBpsHistory] = useState<number[]>(new Array(30).fill(0));
   const [toast, setToast] = useState<{ text: string; kind: "ok" | "err" } | null>(null);
+  const wsOpenRef = useRef(false);
 
   const [banDeviceInput, setBanDeviceInput] = useState("");
   const [banReasonInput, setBanReasonInput] = useState("");
@@ -173,6 +196,13 @@ export default function App() {
 
   const loadAll = useCallback(async () => {
     try {
+      const ss: SetupStatus = await apiFetch("api/v1/setup/status");
+      setSetupStatus(ss);
+      if (ss.needs_setup) {
+        if (ss.admin_user) setSetupUser((prev) => prev || ss.admin_user || "admin");
+        return;
+      }
+
       const [st, cls, pcs, pqs, banList, logList, cfg] = await Promise.all([
         apiFetch("api/v1/status"),
         apiFetch("api/v1/clients"),
@@ -188,7 +218,7 @@ export default function App() {
       setPendingQueues(pqs || []);
       setBans(banList || []);
       setLogs(logList || []);
-      if (typeof st?.relay_bps === "number") {
+      if (!wsOpenRef.current && typeof st?.relay_bps === "number") {
         setBpsHistory((prev) => [...prev.slice(-29), st.relay_bps]);
       }
       if (!cfgInitRef.current && cfg) {
@@ -202,7 +232,14 @@ export default function App() {
           admin_user: cfg.admin_user || "admin",
         }));
       }
-    } catch (e) {
+    } catch (e: any) {
+      if (String(e?.message || "").includes("setup_required")) {
+        try {
+          const ss = await apiFetch("api/v1/setup/status");
+          setSetupStatus(ss);
+        } catch { }
+        return;
+      }
       console.error(e);
     }
   }, [apiFetch]);
@@ -220,6 +257,7 @@ export default function App() {
       ws = new WebSocket(`${proto}://${window.location.host}${apiBase}api/v1/events`);
       ws.onopen = () => {
         backoff = 1000;
+        wsOpenRef.current = true;
       };
       ws.onmessage = (ev) => {
         try {
@@ -232,9 +270,10 @@ export default function App() {
           if (msg.event === "log_entry" && msg.data) {
             setLogs((prev) => [...prev.slice(-499), msg.data]);
           }
-        } catch {}
+        } catch { }
       };
       ws.onclose = () => {
+        wsOpenRef.current = false;
         if (stopped) return;
         reconnectTimer = window.setTimeout(connectWS, backoff);
         backoff = Math.min(backoff * 2, 15000);
@@ -243,12 +282,20 @@ export default function App() {
     };
 
     connectWS();
-    const timer = setInterval(loadAll, 5000);
+    const timer = setInterval(() => {
+      if (!wsOpenRef.current) {
+        loadAll();
+      }
+    }, 10000);
+    const slowTimer = setInterval(() => {
+      loadAll();
+    }, 30000);
     return () => {
       stopped = true;
       if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
       ws?.close();
       clearInterval(timer);
+      clearInterval(slowTimer);
     };
   }, [apiBase, loadAll]);
 
@@ -319,6 +366,163 @@ export default function App() {
     }
   };
 
+  const submitSetup = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSetupErr("");
+    if (setupPass.length < 4) {
+      setSetupErr("Le mot de passe admin doit contenir au moins 4 caractères.");
+      return;
+    }
+    if (setupPass !== setupPassConfirm) {
+      setSetupErr("Les mots de passe ne correspondent pas.");
+      return;
+    }
+    if (setupStatus?.requires_setup_token && !setupToken.trim()) {
+      setSetupErr("Le Setup Token affiché dans la console / logs Docker est requis à distance.");
+      return;
+    }
+    setSetupBusy(true);
+    try {
+      await apiFetch("api/v1/setup", {
+        method: "POST",
+        body: JSON.stringify({
+          setup_token: setupToken.trim(),
+          admin_user: setupUser.trim() || "admin",
+          admin_password: setupPass,
+          auth_token: setupAuthToken.trim(),
+          enable_blind_relay: setupBlindRelay,
+          max_relay_kbps: setupMaxKBps,
+        }),
+      });
+      window.location.reload();
+    } catch (err: any) {
+      setSetupErr(err?.message || "Erreur lors de la configuration.");
+    } finally {
+      setSetupBusy(false);
+    }
+  };
+
+  if (setupStatus?.needs_setup) {
+    return (
+      <div className="min-h-screen bg-[#0b0d11] text-zinc-100 flex items-center justify-center p-4">
+        <form
+          onSubmit={submitSetup}
+          className="w-full max-w-md bg-[#12161d] border border-zinc-800 rounded-xl p-6 shadow-2xl space-y-4"
+        >
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-lg bg-emerald-600/15 border border-emerald-500/30 flex items-center justify-center text-emerald-400">
+              <Shield size={20} />
+            </div>
+            <div>
+              <h1 className="text-base font-semibold text-zinc-100">Configuration initiale — Relay Server</h1>
+              <p className="text-xs text-zinc-400">
+                Définis le compte administrateur avant d'exposer le panneau du relais.
+              </p>
+            </div>
+          </div>
+
+          {setupErr && (
+            <div className="text-xs text-rose-300 bg-rose-950/40 border border-rose-800/50 rounded-md px-3 py-2">
+              {setupErr}
+            </div>
+          )}
+
+          <div className="space-y-3">
+            {setupStatus.requires_setup_token && (
+              <div>
+                <label className="block text-xs font-medium text-amber-300 mb-1">
+                  Setup Token (visible dans les logs du serveur relais)
+                </label>
+                <input
+                  type="text"
+                  required
+                  placeholder="EX: A1B2C3D4..."
+                  value={setupToken}
+                  onChange={(e) => setSetupToken(e.target.value)}
+                  className="w-full bg-[#0b0d11] border border-amber-700/60 rounded-md px-3 py-1.5 text-sm font-mono uppercase"
+                />
+              </div>
+            )}
+
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs font-medium text-zinc-400 mb-1">Utilisateur Admin</label>
+                <input
+                  type="text"
+                  required
+                  value={setupUser}
+                  onChange={(e) => setSetupUser(e.target.value)}
+                  className="w-full bg-[#0b0d11] border border-zinc-700 rounded-md px-3 py-1.5 text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-zinc-400 mb-1">Plafond relais (Ko/s, 0=illimité)</label>
+                <input
+                  type="number"
+                  min={0}
+                  value={setupMaxKBps}
+                  onChange={(e) => setSetupMaxKBps(Number(e.target.value))}
+                  className="w-full bg-[#0b0d11] border border-zinc-700 rounded-md px-3 py-1.5 text-sm"
+                />
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-zinc-400 mb-1">Mot de passe Admin (min 4 car.)</label>
+              <input
+                type="password"
+                required
+                minLength={4}
+                value={setupPass}
+                onChange={(e) => setSetupPass(e.target.value)}
+                className="w-full bg-[#0b0d11] border border-zinc-700 rounded-md px-3 py-1.5 text-sm"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-zinc-400 mb-1">Confirmer le mot de passe</label>
+              <input
+                type="password"
+                required
+                minLength={4}
+                value={setupPassConfirm}
+                onChange={(e) => setSetupPassConfirm(e.target.value)}
+                className="w-full bg-[#0b0d11] border border-zinc-700 rounded-md px-3 py-1.5 text-sm"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-zinc-400 mb-1">AUTH_TOKEN réseau (optionnel)</label>
+              <input
+                type="password"
+                placeholder="Laisser vide pour relais ouvert"
+                value={setupAuthToken}
+                onChange={(e) => setSetupAuthToken(e.target.value)}
+                className="w-full bg-[#0b0d11] border border-zinc-700 rounded-md px-3 py-1.5 text-sm"
+              />
+            </div>
+
+            <label className="flex items-center gap-2 text-xs text-zinc-300 cursor-pointer pt-1">
+              <input
+                type="checkbox"
+                checked={setupBlindRelay}
+                onChange={(e) => setSetupBlindRelay(e.target.checked)}
+              />
+              Activer le Blind Relay (UDP natif + WebSocket si NAT symétrique)
+            </label>
+          </div>
+
+          <button
+            type="submit"
+            disabled={setupBusy}
+            className="w-full py-2.5 rounded-md bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 text-xs font-medium text-white transition"
+          >
+            {setupBusy ? "Activation..." : "Configurer et verrouiller le Relais"}
+          </button>
+        </form>
+      </div>
+    );
+  }
+
   const maxBps = Math.max(1024, ...bpsHistory);
 
   return (
@@ -366,11 +570,10 @@ export default function App() {
               <button
                 key={item.id}
                 onClick={() => setTab(item.id as any)}
-                className={`flex items-center justify-between gap-2 px-3 py-2 rounded-md text-xs font-medium transition whitespace-nowrap ${
-                  active
-                    ? "bg-zinc-800/90 text-white border border-zinc-700/80"
-                    : "text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/40 border border-transparent"
-                }`}
+                className={`flex items-center justify-between gap-2 px-3 py-2 rounded-md text-xs font-medium transition whitespace-nowrap ${active
+                  ? "bg-zinc-800/90 text-white border border-zinc-700/80"
+                  : "text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/40 border border-transparent"
+                  }`}
               >
                 <span className="flex items-center gap-2.5">
                   <Icon size={15} className={active ? "text-emerald-400" : "text-zinc-500"} />
@@ -432,7 +635,7 @@ export default function App() {
                     {formatBytes(status?.relay_bps ?? 0)}/s
                   </div>
                   <div className="text-[11px] text-zinc-500 mt-1">
-                    Total: {formatBytes(status?.relay_bytes_total ?? 0)}
+                    UDP: {formatBytes(status?.udp_relay_bytes_total ?? 0)} · WS: {formatBytes(status?.ws_relay_bytes_total ?? 0)}
                   </div>
                 </div>
                 <div className="bg-[#12161d] border border-zinc-800/90 rounded-lg p-4">
@@ -449,7 +652,9 @@ export default function App() {
                   <div className="text-2xl font-semibold text-zinc-100 mt-1">
                     {status?.active_pair_codes ?? 0} <span className="text-sm text-zinc-500">/ {status?.pending_queues ?? 0}</span>
                   </div>
-                  <div className="text-[11px] text-zinc-500 mt-1">STUN UDP :{status?.stun_port || "off"}</div>
+                  <div className="text-[11px] text-zinc-500 mt-1">
+                    STUN &amp; Relais UDP :{status?.udp_relay_port || status?.stun_port || "off"}
+                  </div>
                 </div>
               </div>
 
@@ -538,7 +743,7 @@ export default function App() {
                               {c.observed_addr || "IP inconnue"}
                             </span>
                             <span className="text-[11px] text-zinc-500">
-                              QUIC :{c.quic_port} · Watch {c.watching_count}
+                              QUIC :{c.quic_port} · Watch {c.watching_count} · {c.udp_relay ? "UDP Relay" : "WS"}
                             </span>
                           </div>
                           <div className="text-[11px] font-mono text-zinc-400 break-all">{c.device_id}</div>
@@ -864,11 +1069,10 @@ export default function App() {
 
       {toast && (
         <div
-          className={`fixed bottom-5 right-5 px-4 py-2.5 rounded-md shadow-xl text-xs font-medium z-50 border ${
-            toast.kind === "err"
-              ? "bg-rose-950/95 border-rose-700 text-rose-100"
-              : "bg-[#161a23] border-zinc-700 text-zinc-100"
-          }`}
+          className={`fixed bottom-5 right-5 px-4 py-2.5 rounded-md shadow-xl text-xs font-medium z-50 border ${toast.kind === "err"
+            ? "bg-rose-950/95 border-rose-700 text-rose-100"
+            : "bg-[#161a23] border-zinc-700 text-zinc-100"
+            }`}
         >
           {toast.text}
         </div>

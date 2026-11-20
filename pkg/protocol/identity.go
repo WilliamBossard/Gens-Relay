@@ -2,12 +2,15 @@ package protocol
 
 import (
 	"crypto/ed25519"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base32"
+	"encoding/base64"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -18,7 +21,7 @@ import (
 	"time"
 )
 
-const ALPNProtocol = "gens-relay/1"
+const ALPNProtocol = "gens-relay/2"
 
 // Identity holds the persistent Ed25519 TLS identity and derived DeviceID of a node.
 type Identity struct {
@@ -226,4 +229,27 @@ func VerifyChallenge(deviceID string, pubKeyDER, challenge, sig []byte) error {
 		return errors.New("invalid Ed25519 signature")
 	}
 	return nil
+}
+
+// ComputeAuthProof computes a challenge-bound HMAC-SHA256 proof of a shared auth token
+// so the raw token is never transmitted over signaling WebSockets.
+func ComputeAuthProof(token string, nonce []byte) string {
+	mac := hmac.New(sha256.New, []byte(token))
+	mac.Write(nonce)
+	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
+}
+
+// VerifyAuthProof verifies a base64-encoded HMAC-SHA256 auth proof in constant time.
+func VerifyAuthProof(token string, nonce []byte, proofB64 string) bool {
+	if token == "" {
+		return true
+	}
+	got, err := base64.StdEncoding.DecodeString(proofB64)
+	if err != nil {
+		return false
+	}
+	mac := hmac.New(sha256.New, []byte(token))
+	mac.Write(nonce)
+	expected := mac.Sum(nil)
+	return subtle.ConstantTimeCompare(got, expected) == 1
 }

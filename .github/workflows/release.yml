@@ -48,14 +48,17 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.27"
-      - name: Build cross-platform Go binaries (including Windows CLI without UI)
+      - name: Build cross-platform Go binaries (daemon, drop CLI, relay server)
         run: |
           mkdir -p dist
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o dist/gens-daemon-windows-amd64.exe ./cmd/gens-daemon
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o dist/gens-drop-windows-amd64.exe ./cmd/gens-drop
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o dist/relay-server-windows-amd64.exe ./cmd/relay-server
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o dist/gens-daemon-linux-amd64 ./cmd/gens-daemon
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o dist/gens-drop-linux-amd64 ./cmd/gens-drop
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o dist/relay-server-linux-amd64 ./cmd/relay-server
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o dist/gens-daemon-linux-arm64 ./cmd/gens-daemon
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o dist/gens-drop-linux-arm64 ./cmd/gens-drop
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o dist/relay-server-linux-arm64 ./cmd/relay-server
       - uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/v')
@@ -83,23 +86,38 @@ jobs:
           cd web && npm install && npm run build
           cd ../relay-web && npm install && npm run build
           cd ..
-          New-Item -ItemType Directory -Force -Path desktop/src-tauri/binaries | Out-Null
-          New-Item -ItemType Directory -Force -Path relay-desktop/src-tauri/binaries | Out-Null
+          New-Item -ItemType Directory -Force -Path dist, desktop/src-tauri/binaries, relay-desktop/src-tauri/binaries | Out-Null
           $env:CGO_ENABLED = "0"
-          go build -ldflags="-s -w" -o desktop/src-tauri/binaries/gens-daemon-x86_64-pc-windows-msvc.exe ./cmd/gens-daemon
+          go build -ldflags="-s -w" -o dist/gens-daemon.exe ./cmd/gens-daemon
+          go build -ldflags="-s -w" -o dist/gens-drop.exe ./cmd/gens-drop
+          Copy-Item dist/gens-daemon.exe desktop/src-tauri/binaries/gens-daemon-x86_64-pc-windows-msvc.exe
           go build -ldflags="-s -w" -o relay-desktop/src-tauri/binaries/relay-server-x86_64-pc-windows-msvc.exe ./cmd/relay-server
-      - name: Build Tauri Desktop Bundles (Daemon UI + Relay Server UI)
+      - name: Build Tauri Desktop Bundles (Daemon UI + Compact Gens-Drop + Relay Server UI)
         shell: pwsh
         run: |
           cd desktop/src-tauri
           cargo tauri build --no-bundle
+          cd ../../drop-desktop/src-tauri
+          cargo tauri build --no-bundle
           cd ../../relay-desktop/src-tauri
           cargo tauri build --no-bundle
+      - name: Build Modular Inno Setup Installer
+        shell: pwsh
+        run: |
+          $iscc = Get-Command iscc -ErrorAction SilentlyContinue
+          if (-not $iscc) {
+            choco install innosetup -y
+            $env:Path += ";C:\Program Files (x86)\Inno Setup 6"
+          }
+          iscc deploy/installer/gens-relay.iss
       - uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/v')
         with:
           files: |
+            dist/gens-relay-setup.exe
+            dist/gens-drop.exe
             desktop/src-tauri/target/release/gens-relay-desktop.exe
+            drop-desktop/src-tauri/target/release/gens-drop-desktop.exe
             relay-desktop/src-tauri/target/release/gens-relay-server-desktop.exe
 
   docker:

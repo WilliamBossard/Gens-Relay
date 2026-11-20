@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,9 +20,12 @@ import (
 	"github.com/WilliamBossard/Gens-Relay/internal/config"
 	"github.com/WilliamBossard/Gens-Relay/internal/p2p"
 	"github.com/WilliamBossard/Gens-Relay/internal/store"
+	"github.com/WilliamBossard/Gens-Relay/internal/syncer"
 	"github.com/WilliamBossard/Gens-Relay/pkg/protocol"
 	"github.com/quic-go/quic-go"
 )
+
+const streamDeadline = 30 * time.Second
 
 type recvProgressBuffer struct {
 	peerID  string
@@ -29,50 +34,138 @@ type recvProgressBuffer struct {
 	seen    map[string]struct{}
 }
 
+// StagedFile describes a file already written to staging and hashed in-flight during upload.
+type StagedFile struct {
+	RelPath   string
+	LocalPath string
+	Size      int64
+	BlockSize int
+	Blocks    []protocol.BlockInfo
+	FileHash  string
+}
+
 type Manager struct {
 	cfg     *config.DaemonConfig
 	store   *store.Store
 	p2p     *p2p.Manager
 	onEmit  func(event string, data any)
 	handles *chunker.FileHandleCache
-	rootCtx context.Context
 
-	mu          sync.Mutex
-	sourceMaps  map[string]map[string]string // transferID -> relPath -> local fullPath
-	stagingDirs map[string]string            // transferID -> staging dir to clean after finish
-	activeCanc  map[string]context.CancelFunc
-	receiveLock map[string]*sync.Mutex
-	recvBuffers map[string]*recvProgressBuffer
-	lastEmitNs  atomic.Int64
-	bytesRx     atomic.Uint64
-	bytesTx     atomic.Uint64
+	rootMu     sync.RWMutex
+	rootCtx    context.Context
+	shutCancel context.CancelFunc
+
+	bgWg sync.WaitGroup
+
+	mu                sync.Mutex
+	sourceMaps        map[string]map[string]string // transferID -> relPath -> local fullPath
+	stagingDirs       map[string]string            // transferID -> staging dir to clean after finish
+	activeCanc        map[string]context.CancelFunc
+	pauseAfterPrep    map[string]bool
+	pausedBeforeOffer map[string]bool
+	receiveLock       map[string]*sync.Mutex
+	recvBuffers       map[string]*recvProgressBuffer
+	lastEmitNs        atomic.Int64
+	bytesRx           atomic.Uint64
+	bytesTx           atomic.Uint64
 }
 
 func NewManager(cfg *config.DaemonConfig, st *store.Store, p2pMgr *p2p.Manager, onEmit func(string, any)) *Manager {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Manager{
-		cfg:         cfg,
-		store:       st,
-		p2p:         p2pMgr,
-		onEmit:      onEmit,
-		handles:     chunker.NewFileHandleCache(48, 5*time.Second),
-		rootCtx:     context.Background(),
-		sourceMaps:  make(map[string]map[string]string),
-		stagingDirs: make(map[string]string),
-		activeCanc:  make(map[string]context.CancelFunc),
-		receiveLock: make(map[string]*sync.Mutex),
-		recvBuffers: make(map[string]*recvProgressBuffer),
+		cfg:               cfg,
+		store:             st,
+		p2p:               p2pMgr,
+		onEmit:            onEmit,
+		handles:           chunker.NewFileHandleCache(48, 5*time.Second),
+		rootCtx:           ctx,
+		shutCancel:        cancel,
+		sourceMaps:        make(map[string]map[string]string),
+		stagingDirs:       make(map[string]string),
+		activeCanc:        make(map[string]context.CancelFunc),
+		pauseAfterPrep:    make(map[string]bool),
+		pausedBeforeOffer: make(map[string]bool),
+		receiveLock:       make(map[string]*sync.Mutex),
+		recvBuffers:       make(map[string]*recvProgressBuffer),
 	}
 }
 
+func (m *Manager) getRootContext() context.Context {
+	m.rootMu.RLock()
+	defer m.rootMu.RUnlock()
+	return m.rootCtx
+}
+
 func (m *Manager) SetRootContext(ctx context.Context) {
-	m.rootCtx = ctx
+	cCtx, cancel := context.WithCancel(ctx)
+	m.rootMu.Lock()
+	if m.shutCancel != nil {
+		m.shutCancel()
+	}
+	m.rootCtx = cCtx
+	m.shutCancel = cancel
+	m.rootMu.Unlock()
+
 	go func() {
-		<-ctx.Done()
+		<-cCtx.Done()
 		m.handles.CloseAll()
 	}()
 }
 
+// Shutdown cancels active Drop tasks, flushes pending receive progress to SQLite, and closes file handles.
+func (m *Manager) Shutdown(ctx context.Context) {
+	m.rootMu.RLock()
+	cancel := m.shutCancel
+	m.rootMu.RUnlock()
+	if cancel != nil {
+		cancel()
+	}
+
+	m.mu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(m.activeCanc))
+	for _, fn := range m.activeCanc {
+		cancels = append(cancels, fn)
+	}
+	recvIDs := make([]string, 0, len(m.recvBuffers))
+	for id := range m.recvBuffers {
+		recvIDs = append(recvIDs, id)
+	}
+	m.mu.Unlock()
+
+	for _, fn := range cancels {
+		fn()
+	}
+	for _, id := range recvIDs {
+		mu := m.getReceiveMutex(id)
+		mu.Lock()
+		m.flushRecvBlocks(id)
+		mu.Unlock()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		m.bgWg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
+
+	m.handles.CloseAll()
+}
+
 func (m *Manager) OnPeerConnected(ctx context.Context, peerID string) {
+	peerID = protocol.NormalizeDeviceID(peerID)
+
+	if queuedIDs, err := m.store.ListQueuedOfflineSendDropIDs(peerID); err == nil {
+		for _, id := range queuedIDs {
+			m.launchBg(func() {
+				m.deliverQueuedTransfer(m.getRootContext(), id)
+			})
+		}
+	}
+
 	ids, err := m.store.ListResumableSendDropIDs(peerID)
 	if err != nil {
 		return
@@ -82,17 +175,25 @@ func (m *Manager) OnPeerConnected(ctx context.Context, peerID string) {
 		_, running := m.activeCanc[id]
 		m.mu.Unlock()
 		if !running {
-			go m.runSendTransfer(m.rootCtx, id)
+			tid := id
+			m.launchBg(func() {
+				m.runSendTransfer(m.getRootContext(), tid)
+			})
 		}
 	}
 }
 
-// SendText sends an instant clipboard/text snippet to a connected peer.
+func (m *Manager) launchBg(fn func()) {
+	m.bgWg.Add(1)
+	go func() {
+		defer m.bgWg.Done()
+		fn()
+	}()
+}
+
+// SendText sends an instant clipboard/text snippet to a peer (or queues it offline until connected).
 func (m *Manager) SendText(ctx context.Context, peerID, text string) (*store.DropTransferRecord, error) {
 	peerID = protocol.NormalizeDeviceID(peerID)
-	if !m.p2p.IsConnected(peerID) {
-		return nil, fmt.Errorf("appareil %s non connecté en P2P", peerID)
-	}
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" {
 		return nil, errors.New("texte vide")
@@ -112,18 +213,28 @@ func (m *Manager) SendText(ctx context.Context, peerID, text string) (*store.Dro
 	}
 
 	rec := store.DropTransferRecord{
-		TransferID:       transferID,
-		Direction:        "send",
-		Kind:             "text",
-		PeerID:           peerID,
-		PeerName:         peerName,
-		Title:            title,
-		TextContent:      text,
-		TotalSize:        int64(len(text)),
-		TransferredBytes: int64(len(text)),
-		Status:           "completed",
-		CompletedBlocks:  map[string][]int{},
+		TransferID:      transferID,
+		Direction:       "send",
+		Kind:            "text",
+		PeerID:          peerID,
+		PeerName:        peerName,
+		Title:           title,
+		TextContent:     text,
+		TotalSize:       int64(len(text)),
+		Status:          "queued_offline",
+		CompletedBlocks: map[string][]int{},
 	}
+
+	if !m.p2p.IsConnected(peerID) {
+		if err := m.store.UpsertDropTransfer(rec); err != nil {
+			return nil, err
+		}
+		m.emitUpdateForce()
+		return &rec, nil
+	}
+
+	rec.TransferredBytes = int64(len(text))
+	rec.Status = "completed"
 	if err := m.store.UpsertDropTransfer(rec); err != nil {
 		return nil, err
 	}
@@ -139,7 +250,15 @@ func (m *Manager) SendText(ctx context.Context, peerID, text string) (*store.Dro
 		FileCount:   0,
 	}
 	if err := m.p2p.SendControl(peerID, protocol.CtrlDropOffer, offer); err != nil {
+		if !m.p2p.IsConnected(peerID) {
+			rec.Status = "queued_offline"
+			rec.TransferredBytes = 0
+			_ = m.store.UpsertDropTransfer(rec)
+			m.emitUpdateForce()
+			return &rec, nil
+		}
 		rec.Status = "failed"
+		rec.TransferredBytes = 0
 		rec.ErrorMsg = err.Error()
 		_ = m.store.UpsertDropTransfer(rec)
 		m.emitUpdateForce()
@@ -158,7 +277,8 @@ func (m *Manager) ListTransfers() ([]store.DropTransferRecord, error) {
 	return m.store.ListDropTransfersSummary()
 }
 
-// SendPaths creates a Drop offer for one or more local files/directories and sends it to peerID.
+// SendPaths creates a Drop offer for one or more local files/directories, hashes asynchronously,
+// and dispatches or queues it for peerID.
 func (m *Manager) SendPaths(ctx context.Context, peerID string, localPaths []string) (*store.DropTransferRecord, error) {
 	return m.sendPathsInternal(ctx, peerID, localPaths, "")
 }
@@ -168,93 +288,90 @@ func (m *Manager) SendStagedPaths(ctx context.Context, peerID, stagingDir string
 	return m.sendPathsInternal(ctx, peerID, localPaths, stagingDir)
 }
 
+// SendPrehashedStagedPaths dispatches multipart uploads whose BLAKE3 adaptive blocks were already
+// computed inline during upload streaming, eliminating a second disk read pass.
+func (m *Manager) SendPrehashedStagedPaths(ctx context.Context, peerID, stagingDir string, staged []StagedFile) (*store.DropTransferRecord, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	peerID = protocol.NormalizeDeviceID(peerID)
+	if len(staged) == 0 {
+		return nil, errors.New("aucun fichier ou dossier sélectionné")
+	}
+
+	usedRel := make(map[string]struct{}, len(staged))
+	entries := make([]protocol.DropFileEntry, 0, len(staged))
+	srcMap := make(map[string]string, len(staged))
+	var totalSize int64
+
+	for _, sf := range staged {
+		rel := ensureUniqueRelPath(filepath.ToSlash(strings.TrimLeft(filepath.ToSlash(sf.RelPath), "/")), usedRel)
+		entries = append(entries, protocol.DropFileEntry{
+			RelPath:   rel,
+			Size:      sf.Size,
+			IsDir:     false,
+			BlockSize: sf.BlockSize,
+			Blocks:    sf.Blocks,
+			FileHash:  sf.FileHash,
+		})
+		srcMap[rel] = sf.LocalPath
+		totalSize += sf.Size
+	}
+
+	transferID := newTransferID()
+	title := path.Base(entries[0].RelPath)
+	if len(entries) > 1 {
+		title = fmt.Sprintf("%s (+%d)", title, len(entries)-1)
+	}
+
+	peerName := peerID
+	if dev, err := m.store.GetDevice(peerID); err == nil && dev.Name != "" {
+		peerName = dev.Name
+	}
+
+	srcJSON, _ := json.Marshal(srcMap)
+	rec := store.DropTransferRecord{
+		TransferID:      transferID,
+		Direction:       "send",
+		Kind:            "files",
+		PeerID:          peerID,
+		PeerName:        peerName,
+		Title:           title,
+		SourceRoot:      string(srcJSON),
+		StagingDir:      stagingDir,
+		TotalSize:       totalSize,
+		Status:          "pending_accept",
+		Files:           entries,
+		CompletedBlocks: map[string][]int{},
+	}
+
+	m.mu.Lock()
+	m.sourceMaps[transferID] = srcMap
+	if stagingDir != "" {
+		m.stagingDirs[transferID] = stagingDir
+	}
+	m.mu.Unlock()
+
+	if err := m.dispatchOffer(&rec, len(entries)); err != nil {
+		m.cleanupTransferMem(transferID)
+		return nil, err
+	}
+	return &rec, nil
+}
+
 func (m *Manager) sendPathsInternal(ctx context.Context, peerID string, localPaths []string, stagingDir string) (*store.DropTransferRecord, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	peerID = protocol.NormalizeDeviceID(peerID)
-	if !m.p2p.IsConnected(peerID) {
-		return nil, fmt.Errorf("appareil %s non connecté en P2P", peerID)
-	}
 	if len(localPaths) == 0 {
 		return nil, errors.New("aucun fichier ou dossier sélectionné")
 	}
 
-	var entries []protocol.DropFileEntry
-	srcMap := make(map[string]string)
-	var totalSize int64
-	var fileCount int
-
-	for _, rawPath := range localPaths {
-		cleanPath := filepath.Clean(rawPath)
-		info, err := os.Stat(cleanPath)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return nil, fmt.Errorf("fichier introuvable sur cette machine (%s). Utilise le glisser-déposer ou 'Choisir des fichiers' si le fichier est sur un autre PC", cleanPath)
-			}
-			return nil, fmt.Errorf("accès impossible à %s : %v", cleanPath, err)
-		}
-		baseName := filepath.Base(cleanPath)
-
-		if !info.IsDir() {
-			blocks, fileHash, sz, err := chunker.HashFileBlocks(cleanPath, chunker.DefaultBlockSize)
-			if err != nil {
-				return nil, err
-			}
-			rel := filepath.ToSlash(baseName)
-			entries = append(entries, protocol.DropFileEntry{
-				RelPath:  rel,
-				Size:     sz,
-				IsDir:    false,
-				Blocks:   blocks,
-				FileHash: fileHash,
-			})
-			srcMap[rel] = cleanPath
-			totalSize += sz
-			fileCount++
-			continue
-		}
-
-		err = filepath.WalkDir(cleanPath, func(cur string, d os.DirEntry, walkErr error) error {
-			if walkErr != nil {
-				return walkErr
-			}
-			if d.Type()&os.ModeSymlink != 0 {
-				return nil
-			}
-			subRel, err := filepath.Rel(filepath.Dir(cleanPath), cur)
-			if err != nil {
-				return err
-			}
-			rel := filepath.ToSlash(subRel)
-			if d.IsDir() {
-				entries = append(entries, protocol.DropFileEntry{
-					RelPath: rel,
-					IsDir:   true,
-				})
-				return nil
-			}
-			blocks, fileHash, sz, err := chunker.HashFileBlocks(cur, chunker.DefaultBlockSize)
-			if err != nil {
-				return err
-			}
-			entries = append(entries, protocol.DropFileEntry{
-				RelPath:  rel,
-				Size:     sz,
-				IsDir:    false,
-				Blocks:   blocks,
-				FileHash: fileHash,
-			})
-			srcMap[rel] = cur
-			totalSize += sz
-			fileCount++
-			return nil
-		})
-		if err != nil {
-			return nil, err
-		}
+	entries, srcMap, totalSize, fileCount, err := collectPathsForDrop(localPaths)
+	if err != nil {
+		return nil, err
 	}
-
 	if fileCount == 0 {
 		return nil, errors.New("no files found to send")
 	}
@@ -270,52 +387,269 @@ func (m *Manager) sendPathsInternal(ctx context.Context, peerID string, localPat
 		peerName = dev.Name
 	}
 
+	srcJSON, _ := json.Marshal(srcMap)
 	rec := store.DropTransferRecord{
 		TransferID:      transferID,
 		Direction:       "send",
+		Kind:            "files",
 		PeerID:          peerID,
 		PeerName:        peerName,
 		Title:           title,
-		SourceRoot:      filepath.Dir(localPaths[0]),
+		SourceRoot:      string(srcJSON),
+		StagingDir:      stagingDir,
 		TotalSize:       totalSize,
-		Status:          "pending_accept",
+		Status:          "preparing",
 		Files:           entries,
 		CompletedBlocks: map[string][]int{},
 	}
-
-	srcJSON, _ := json.Marshal(srcMap)
-	rec.SourceRoot = string(srcJSON)
 
 	if err := m.store.UpsertDropTransfer(rec); err != nil {
 		return nil, err
 	}
 
+	prepCtx, prepCancel := context.WithCancel(m.getRootContext())
 	m.mu.Lock()
 	m.sourceMaps[transferID] = srcMap
 	if stagingDir != "" {
 		m.stagingDirs[transferID] = stagingDir
 	}
+	m.activeCanc[transferID] = prepCancel
 	m.mu.Unlock()
 
-	offer := protocol.DropOfferMsg{
-		TransferID: transferID,
-		SenderName: m.cfg.Snapshot().NodeName,
-		Title:      title,
-		TotalSize:  totalSize,
-		FileCount:  fileCount,
-		Files:      entries,
+	m.emitUpdateForce()
+	m.launchBg(func() {
+		m.prepareAndDispatchTransfer(prepCtx, prepCancel, transferID, rec, entries, srcMap, fileCount)
+	})
+
+	return &rec, nil
+}
+
+func (m *Manager) prepareAndDispatchTransfer(
+	prepCtx context.Context,
+	prepCancel context.CancelFunc,
+	transferID string,
+	rec store.DropTransferRecord,
+	entries []protocol.DropFileEntry,
+	srcMap map[string]string,
+	fileCount int,
+) {
+	defer func() {
+		prepCancel()
+		m.mu.Lock()
+		delete(m.activeCanc, transferID)
+		m.mu.Unlock()
+	}()
+
+	type hashJob struct {
+		idx       int
+		localPath string
 	}
-	if err := m.p2p.SendControl(peerID, protocol.CtrlDropOffer, offer); err != nil {
-		rec.Status = "failed"
-		rec.ErrorMsg = err.Error()
-		_ = m.store.UpsertDropTransfer(rec)
+	var jobs []hashJob
+	for i, e := range entries {
+		if e.IsDir {
+			continue
+		}
+		if lp, ok := srcMap[e.RelPath]; ok {
+			jobs = append(jobs, hashJob{idx: i, localPath: lp})
+		}
+	}
+
+	if len(jobs) > 0 {
+		workers := runtime.NumCPU()
+		if workers > 8 {
+			workers = 8
+		}
+		if workers < 1 {
+			workers = 1
+		}
+		if len(jobs) < workers {
+			workers = len(jobs)
+		}
+
+		jobCh := make(chan hashJob, len(jobs))
+		for _, j := range jobs {
+			jobCh <- j
+		}
+		close(jobCh)
+
+		var firstErr error
+		var errOnce sync.Once
+		var wg sync.WaitGroup
+		var hashedTotalSize atomic.Int64
+
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for j := range jobCh {
+					if prepCtx.Err() != nil {
+						return
+					}
+					if entries[j.idx].Size == 0 {
+						// Verify readable and record empty block metadata cleanly
+						if _, err := os.Stat(j.localPath); err != nil {
+							errOnce.Do(func() {
+								firstErr = err
+								prepCancel()
+							})
+							return
+						}
+						entries[j.idx].BlockSize = chunker.AdaptiveBlockSize(0)
+						entries[j.idx].FileHash = chunker.ComputeMerkleFileHash(nil)
+						continue
+					}
+					blocks, fileHash, sz, blkSize, err := chunker.HashFileBlocksAdaptive(j.localPath)
+					if err != nil {
+						errOnce.Do(func() {
+							firstErr = err
+							prepCancel()
+						})
+						return
+					}
+					entries[j.idx].Size = sz
+					entries[j.idx].BlockSize = blkSize
+					entries[j.idx].Blocks = blocks
+					entries[j.idx].FileHash = fileHash
+					hashedTotalSize.Add(sz)
+				}
+			}()
+		}
+		wg.Wait()
+
+		if firstErr != nil || prepCtx.Err() != nil {
+			latest, _ := m.store.GetDropTransfer(transferID)
+			if latest != nil && latest.Status == "canceled" {
+				m.cleanupTransferMem(transferID)
+				m.emitUpdateForce()
+				return
+			}
+			errMsg := ""
+			if firstErr != nil {
+				errMsg = firstErr.Error()
+			} else if prepCtx.Err() != nil {
+				errMsg = prepCtx.Err().Error()
+			}
+			_ = m.store.UpdateDropStatusOnly(transferID, "failed", errMsg)
+			m.cleanupTransferMem(transferID)
+			m.emitUpdateForce()
+			return
+		}
+		rec.TotalSize = hashedTotalSize.Load()
+	}
+
+	latest, err := m.store.GetDropTransfer(transferID)
+	if err == nil && latest.Status == "canceled" {
 		m.cleanupTransferMem(transferID)
 		m.emitUpdateForce()
-		return nil, err
+		return
+	}
+
+	rec.Files = entries
+
+	m.mu.Lock()
+	shouldPause := m.pauseAfterPrep[transferID]
+	delete(m.pauseAfterPrep, transferID)
+	if shouldPause {
+		m.pausedBeforeOffer[transferID] = true
+	}
+	m.mu.Unlock()
+
+	if shouldPause {
+		rec.Status = "paused"
+		_ = m.store.UpsertDropTransfer(rec)
+		m.emitUpdateForce()
+		return
+	}
+
+	if err := m.dispatchOffer(&rec, fileCount); err != nil {
+		m.emitUpdateForce()
+	}
+}
+
+func (m *Manager) dispatchOffer(rec *store.DropTransferRecord, fileCount int) error {
+	if !m.p2p.IsConnected(rec.PeerID) {
+		rec.Status = "queued_offline"
+		rec.ErrorMsg = ""
+		if err := m.store.UpsertDropTransfer(*rec); err != nil {
+			return err
+		}
+		m.emitUpdateForce()
+		return nil
+	}
+
+	rec.Status = "pending_accept"
+	rec.ErrorMsg = ""
+	if err := m.store.UpsertDropTransfer(*rec); err != nil {
+		return err
+	}
+
+	offer := protocol.DropOfferMsg{
+		TransferID: rec.TransferID,
+		SenderName: m.cfg.Snapshot().NodeName,
+		Kind:       "files",
+		Title:      rec.Title,
+		TotalSize:  rec.TotalSize,
+		FileCount:  fileCount,
+		Files:      rec.Files,
+	}
+	if err := m.p2p.SendControl(rec.PeerID, protocol.CtrlDropOffer, offer); err != nil {
+		if !m.p2p.IsConnected(rec.PeerID) {
+			rec.Status = "queued_offline"
+			rec.ErrorMsg = ""
+			_ = m.store.UpsertDropTransfer(*rec)
+			m.emitUpdateForce()
+			return nil
+		}
+		rec.Status = "failed"
+		rec.ErrorMsg = err.Error()
+		_ = m.store.UpsertDropTransfer(*rec)
+		m.emitUpdateForce()
+		return err
 	}
 
 	m.emitUpdateForce()
-	return &rec, nil
+	return nil
+}
+
+func (m *Manager) deliverQueuedTransfer(ctx context.Context, transferID string) {
+	if ctx.Err() != nil {
+		return
+	}
+	rec, err := m.store.GetDropTransfer(transferID)
+	if err != nil || rec.Status != "queued_offline" {
+		return
+	}
+	if !m.p2p.IsConnected(rec.PeerID) {
+		return
+	}
+
+	if rec.Kind == "text" {
+		offer := protocol.DropOfferMsg{
+			TransferID:  rec.TransferID,
+			SenderName:  m.cfg.Snapshot().NodeName,
+			Kind:        "text",
+			Title:       rec.Title,
+			TextContent: rec.TextContent,
+			MimeType:    "text/plain",
+			TotalSize:   rec.TotalSize,
+		}
+		if err := m.p2p.SendControl(rec.PeerID, protocol.CtrlDropOffer, offer); err == nil {
+			rec.Status = "completed"
+			rec.TransferredBytes = rec.TotalSize
+			_ = m.store.UpsertDropTransfer(*rec)
+			m.bytesTx.Add(uint64(len(rec.TextContent)))
+			m.emitUpdateForce()
+		}
+		return
+	}
+
+	fileCount := 0
+	for _, f := range rec.Files {
+		if !f.IsDir {
+			fileCount++
+		}
+	}
+	_ = m.dispatchOffer(rec, fileCount)
 }
 
 func (m *Manager) HandleOffer(ctx context.Context, peerID string, raw json.RawMessage) {
@@ -323,6 +657,7 @@ func (m *Manager) HandleOffer(ctx context.Context, peerID string, raw json.RawMe
 	if err := json.Unmarshal(raw, &offer); err != nil {
 		return
 	}
+	peerID = protocol.NormalizeDeviceID(peerID)
 
 	peerName := offer.SenderName
 	autoAccept := false
@@ -351,6 +686,10 @@ func (m *Manager) HandleOffer(ctx context.Context, peerID string, raw json.RawMe
 			m.bytesRx.Add(uint64(len(offer.TextContent)))
 			m.emitUpdateForce()
 		}
+		return
+	}
+
+	if existing, err := m.store.GetDropTransfer(offer.TransferID); err == nil && existing != nil {
 		return
 	}
 
@@ -396,6 +735,7 @@ func (m *Manager) RespondOffer(transferID string, accept bool, destDir string) e
 			Accepted:   false,
 			Reason:     "rejected by user",
 		})
+		_ = m.store.PruneCompletedDropBlocks(transferID)
 		m.cleanupTransferMem(transferID)
 		m.emitUpdateForce()
 		return nil
@@ -408,6 +748,13 @@ func (m *Manager) RespondOffer(transferID string, accept bool, destDir string) e
 		return err
 	}
 
+	if rec.TotalSize > 0 {
+		if freeBytes, dErr := syncer.AvailableDiskBytes(destDir); dErr == nil && freeBytes < uint64(rec.TotalSize) {
+			return fmt.Errorf("espace disque insuffisant dans %s (%d Mo requis, %d Mo disponibles)",
+				destDir, rec.TotalSize/(1024*1024)+1, freeBytes/(1024*1024))
+		}
+	}
+
 	rec.DestDir = destDir
 	rec.Status = "transferring"
 	if err := m.store.UpsertDropTransfer(*rec); err != nil {
@@ -418,7 +765,6 @@ func (m *Manager) RespondOffer(transferID string, accept bool, destDir string) e
 		TransferID: transferID,
 		Accepted:   true,
 	}); err != nil {
-		// Revert status so user can retry accepting once sender is back online
 		rec.Status = "pending_accept"
 		_ = m.store.UpdateDropProgress(transferID, "pending_accept", "", rec.TransferredBytes, rec.CompletedBlocks)
 		m.emitUpdateForce()
@@ -454,6 +800,7 @@ func (m *Manager) HandleResponse(ctx context.Context, peerID string, raw json.Ra
 	}
 	if !resp.Accepted {
 		_ = m.store.UpdateDropProgress(resp.TransferID, "rejected", resp.Reason, rec.TransferredBytes, rec.CompletedBlocks)
+		_ = m.store.PruneCompletedDropBlocks(resp.TransferID)
 		m.cleanupTransferMem(resp.TransferID)
 		m.emitUpdateForce()
 		return
@@ -466,7 +813,10 @@ func (m *Manager) HandleResponse(ctx context.Context, peerID string, raw json.Ra
 	_, alreadyRunning := m.activeCanc[resp.TransferID]
 	m.mu.Unlock()
 	if !alreadyRunning {
-		go m.runSendTransfer(m.rootCtx, resp.TransferID)
+		tid := resp.TransferID
+		m.launchBg(func() {
+			m.runSendTransfer(m.getRootContext(), tid)
+		})
 	}
 }
 
@@ -475,15 +825,29 @@ func (m *Manager) PauseTransfer(transferID string) error {
 	if err != nil {
 		return err
 	}
+	if rec.Status == "preparing" {
+		m.mu.Lock()
+		m.pauseAfterPrep[transferID] = true
+		m.mu.Unlock()
+		return nil
+	}
+
 	wasTransferring := rec.Status == "transferring"
 	if wasTransferring {
 		_ = m.store.UpdateDropProgress(transferID, "paused", "", rec.TransferredBytes, rec.CompletedBlocks)
 	}
+
+	// Flush pending receive progress BEFORE deleting recvBuffers so up to 15 blocks aren't lost.
+	mu := m.getReceiveMutex(transferID)
+	mu.Lock()
+	m.flushRecvBlocks(transferID)
 	m.mu.Lock()
 	cancel, ok := m.activeCanc[transferID]
 	delete(m.recvBuffers, transferID)
 	m.mu.Unlock()
-	if ok {
+	mu.Unlock()
+
+	if ok && wasTransferring {
 		cancel()
 	}
 	if wasTransferring {
@@ -508,10 +872,16 @@ func (m *Manager) HandlePause(peerID string, raw json.RawMessage) {
 	if rec.Status == "transferring" {
 		_ = m.store.UpdateDropProgress(msg.TransferID, "paused", "", rec.TransferredBytes, rec.CompletedBlocks)
 	}
+
+	mu := m.getReceiveMutex(msg.TransferID)
+	mu.Lock()
+	m.flushRecvBlocks(msg.TransferID)
 	m.mu.Lock()
 	cancel, ok := m.activeCanc[msg.TransferID]
 	delete(m.recvBuffers, msg.TransferID)
 	m.mu.Unlock()
+	mu.Unlock()
+
 	if ok {
 		cancel()
 	}
@@ -538,9 +908,13 @@ func (m *Manager) CancelTransfer(transferID string) error {
 	if err != nil {
 		return err
 	}
+	wasLocalOnly := rec.Status == "preparing" || rec.Status == "queued_offline"
+
 	_ = m.store.UpdateDropProgress(transferID, "canceled", "canceled by user", rec.TransferredBytes, rec.CompletedBlocks)
 
 	m.mu.Lock()
+	delete(m.pauseAfterPrep, transferID)
+	delete(m.pausedBeforeOffer, transferID)
 	cancel, ok := m.activeCanc[transferID]
 	m.mu.Unlock()
 	if ok {
@@ -550,10 +924,13 @@ func (m *Manager) CancelTransfer(transferID string) error {
 	if rec.Direction == "receive" && rec.DestDir != "" {
 		m.cleanupTempFiles(rec)
 	}
-	_ = m.p2p.SendControl(rec.PeerID, protocol.CtrlDropCancel, protocol.DropCancelMsg{
-		TransferID: transferID,
-		Reason:     "canceled by user",
-	})
+	if !wasLocalOnly {
+		_ = m.p2p.SendControl(rec.PeerID, protocol.CtrlDropCancel, protocol.DropCancelMsg{
+			TransferID: transferID,
+			Reason:     "canceled by user",
+		})
+	}
+	_ = m.store.PruneCompletedDropBlocks(transferID)
 	m.cleanupTransferMem(transferID)
 	m.emitUpdateForce()
 	return nil
@@ -561,7 +938,7 @@ func (m *Manager) CancelTransfer(transferID string) error {
 
 func (m *Manager) DeleteTransfer(transferID string) error {
 	if rec, err := m.store.GetDropTransfer(transferID); err == nil {
-		if rec.Status == "transferring" || rec.Status == "pending_accept" {
+		if rec.Status == "transferring" || rec.Status == "pending_accept" || rec.Status == "preparing" || rec.Status == "queued_offline" {
 			_ = m.CancelTransfer(transferID)
 		}
 	}
@@ -591,6 +968,7 @@ func (m *Manager) HandleCancel(peerID string, raw json.RawMessage) {
 	if rec.Direction == "receive" && rec.DestDir != "" {
 		m.cleanupTempFiles(rec)
 	}
+	_ = m.store.PruneCompletedDropBlocks(msg.TransferID)
 	m.cleanupTransferMem(msg.TransferID)
 	m.emitUpdateForce()
 }
@@ -600,9 +978,28 @@ func (m *Manager) ResumeTransfer(ctx context.Context, transferID string) error {
 	if err != nil {
 		return err
 	}
+
+	// If still preparing asynchronously, simply clear any pending pause flag.
+	if rec.Status == "preparing" {
+		m.mu.Lock()
+		delete(m.pauseAfterPrep, transferID)
+		m.mu.Unlock()
+		return nil
+	}
+
+	if rec.Status == "queued_offline" && rec.Direction == "send" {
+		if m.p2p.IsConnected(rec.PeerID) {
+			m.launchBg(func() {
+				m.deliverQueuedTransfer(m.getRootContext(), transferID)
+			})
+		}
+		return nil
+	}
+
 	if rec.Status != "paused" && rec.Status != "failed" {
 		return nil
 	}
+
 	if rec.Direction == "receive" {
 		_ = m.store.UpdateDropProgress(transferID, "transferring", "", rec.TransferredBytes, rec.CompletedBlocks)
 		if err := m.p2p.SendControl(rec.PeerID, protocol.CtrlDropResponse, protocol.DropResponseMsg{
@@ -616,12 +1013,30 @@ func (m *Manager) ResumeTransfer(ctx context.Context, transferID string) error {
 		m.emitUpdateForce()
 		return nil
 	}
+
+	m.mu.Lock()
+	beforeOffer := m.pausedBeforeOffer[transferID]
+	delete(m.pausedBeforeOffer, transferID)
+	m.mu.Unlock()
+
+	if beforeOffer {
+		fileCount := 0
+		for _, f := range rec.Files {
+			if !f.IsDir {
+				fileCount++
+			}
+		}
+		return m.dispatchOffer(rec, fileCount)
+	}
+
 	_ = m.store.UpdateDropProgress(transferID, "transferring", "", rec.TransferredBytes, rec.CompletedBlocks)
 	_ = m.p2p.SendControl(rec.PeerID, protocol.CtrlDropResume, protocol.DropPauseMsg{
 		TransferID: transferID,
 	})
 	m.emitUpdateForce()
-	go m.runSendTransfer(m.rootCtx, transferID)
+	m.launchBg(func() {
+		m.runSendTransfer(m.getRootContext(), transferID)
+	})
 	return nil
 }
 
@@ -692,10 +1107,12 @@ func (m *Manager) runSendTransfer(parentCtx context.Context, transferID string) 
 		close(jobs)
 
 		var recMu sync.Mutex
+		var lastTransferred atomic.Int64
+		lastTransferred.Store(rec.TransferredBytes)
 		var firstErr error
 		var errOnce sync.Once
 		var pending []store.DropBlockCompletion
-		var lastFlush = time.Now()
+		lastFlush := time.Now()
 		var wg sync.WaitGroup
 
 		flushPending := func(force bool) {
@@ -710,7 +1127,7 @@ func (m *Manager) runSendTransfer(parentCtx context.Context, transferID string) 
 			recMu.Unlock()
 
 			if total, err := m.store.MarkDropBlocksCompleted(transferID, batch); err == nil {
-				rec.TransferredBytes = total
+				lastTransferred.Store(total)
 			}
 			m.emitUpdate()
 		}
@@ -776,6 +1193,7 @@ func (m *Manager) runSendTransfer(parentCtx context.Context, transferID string) 
 						go func() {
 							defer ackWg.Done()
 							for sentJob := range curAckQ {
+								_ = curStream.SetReadDeadline(time.Now().Add(streamDeadline))
 								var ack protocol.DropChunkAck
 								if err := protocol.ReadFrame(curStream, &ack); err != nil {
 									select {
@@ -847,7 +1265,6 @@ func (m *Manager) runSendTransfer(parentCtx context.Context, transferID string) 
 		wg.Wait()
 		flushPending(true)
 
-		// Release cached read handles for source files once sending stops
 		for _, p := range srcMap {
 			m.handles.ClosePath(p)
 		}
@@ -879,6 +1296,7 @@ func (m *Manager) runSendTransfer(parentCtx context.Context, transferID string) 
 	}
 
 	_ = m.store.UpdateDropProgress(transferID, "completed", "", rec.TotalSize, nil)
+	_ = m.store.PruneCompletedDropBlocks(transferID)
 	m.cleanupTransferMem(transferID)
 	m.emitUpdateForce()
 }
@@ -890,9 +1308,18 @@ func (m *Manager) cleanupTransferMem(transferID string) {
 	delete(m.sourceMaps, transferID)
 	delete(m.receiveLock, transferID)
 	delete(m.recvBuffers, transferID)
+	delete(m.pauseAfterPrep, transferID)
+	delete(m.pausedBeforeOffer, transferID)
 	m.mu.Unlock()
-	if hasStage && dir != "" {
+
+	if (!hasStage || dir == "") && m.store != nil {
+		if rec, err := m.store.GetDropTransfer(transferID); err == nil && rec.StagingDir != "" {
+			dir = rec.StagingDir
+		}
+	}
+	if dir != "" {
 		_ = os.RemoveAll(dir)
+		_ = m.store.ClearDropStagingDir(transferID)
 	}
 }
 
@@ -908,17 +1335,23 @@ func (m *Manager) cleanupTempFiles(rec *store.DropTransferRecord) {
 	}
 }
 
-func (m *Manager) writeChunkNoAck(ctx context.Context, stream *quic.Stream, transferID, relPath string, blockIdx int, blk protocol.BlockInfo, localFile string, bufPtr *[]byte) error {
+func (m *Manager) writeChunkNoAck(ctx context.Context, stream *quic.Stream, transferID, relPath string, blockIdx int, blk protocol.BlockInfo, localFile string, defaultBuf *[]byte) error {
 	var data []byte
-	var err error
-	if blk.Size > 0 && blk.Size <= chunker.DefaultBlockSize {
-		data = (*bufPtr)[:blk.Size]
-		err = m.handles.ReadBlockInto(localFile, blk.Offset, blk.Size, blk.Hash, data)
+	if blk.Size > 0 && defaultBuf != nil && blk.Size <= cap(*defaultBuf) {
+		data = (*defaultBuf)[:blk.Size]
 	} else {
-		data, err = chunker.ReadBlock(localFile, blk.Offset, blk.Size, blk.Hash)
+		sizedPtr := chunker.GetBufferSize(blk.Size)
+		defer chunker.PutBufferSized(sizedPtr)
+		data = (*sizedPtr)[:blk.Size]
 	}
-	if err != nil {
+	if err := m.handles.ReadBlockInto(localFile, blk.Offset, blk.Size, blk.Hash, data); err != nil {
 		return err
+	}
+
+	wireData := data
+	compressed := false
+	if m.p2p.CompressionEnabled() {
+		wireData, compressed = chunker.CompressBlockIfWorthwhile(relPath, data)
 	}
 
 	hdr := protocol.DropChunkHeader{
@@ -928,11 +1361,14 @@ func (m *Manager) writeChunkNoAck(ctx context.Context, stream *quic.Stream, tran
 		Offset:     blk.Offset,
 		Size:       blk.Size,
 		Hash:       blk.Hash,
+		Compressed: compressed,
+		WireSize:   len(wireData),
 	}
+	_ = stream.SetWriteDeadline(time.Now().Add(streamDeadline))
 	if err := protocol.WriteFrame(stream, hdr); err != nil {
 		return err
 	}
-	_, err = m.p2p.LimitedWrite(ctx, stream, data)
+	_, err := m.p2p.LimitedWrite(ctx, stream, wireData)
 	return err
 }
 
@@ -941,62 +1377,100 @@ func (m *Manager) ServeChunkStream(ctx context.Context, peerID string, stream *q
 	defer stream.Close()
 	normPeer := protocol.NormalizeDeviceID(peerID)
 
-	bufPtr := chunker.GetBuffer()
-	defer chunker.PutBuffer(bufPtr)
+	defaultPtr := chunker.GetBuffer()
+	defer chunker.PutBuffer(defaultPtr)
 
 	for {
-		var hdr protocol.DropChunkHeader
-		if err := protocol.ReadFrame(stream, &hdr); err != nil {
-			return
-		}
-		if hdr.Size <= 0 || hdr.Size > protocol.MaxFrameSize {
-			_ = protocol.WriteFrame(stream, protocol.DropChunkAck{OK: false, Error: "invalid chunk size"})
-			return
-		}
-
-		var buf []byte
-		if hdr.Size <= chunker.DefaultBlockSize {
-			buf = (*bufPtr)[:hdr.Size]
-		} else {
-			buf = make([]byte, hdr.Size)
-		}
-
-		if _, err := m.p2p.LimitedReadFull(ctx, stream, buf); err != nil {
-			_ = protocol.WriteFrame(stream, protocol.DropChunkAck{OK: false, Error: err.Error()})
-			return
-		}
-		if hdr.Hash != "" && chunker.HashBytes(buf) != hdr.Hash {
-			_ = protocol.WriteFrame(stream, protocol.DropChunkAck{OK: false, Error: "chunk hash mismatch"})
-			return
-		}
-
-		destDir, ok := m.getActiveRecvDestDir(hdr.TransferID, normPeer)
-		if !ok {
-			_ = protocol.WriteFrame(stream, protocol.DropChunkAck{OK: false, Error: "transfer not active"})
-			return
-		}
-
-		tmpPath, err := tempTransferPath(destDir, hdr.TransferID, hdr.RelPath)
-		if err != nil {
-			_ = protocol.WriteFrame(stream, protocol.DropChunkAck{OK: false, Error: err.Error()})
-			return
-		}
-		if err := os.MkdirAll(filepath.Dir(tmpPath), 0755); err != nil {
-			_ = protocol.WriteFrame(stream, protocol.DropChunkAck{OK: false, Error: err.Error()})
-			return
-		}
-
-		if err := m.handles.WriteAt(tmpPath, hdr.Offset, buf); err != nil {
-			_ = protocol.WriteFrame(stream, protocol.DropChunkAck{OK: false, Error: "disk write error"})
-			return
-		}
-		m.bytesRx.Add(uint64(len(buf)))
-
-		m.recordRecvBlock(hdr.TransferID, hdr.RelPath, hdr.BlockIdx, int64(hdr.Size))
-		if err := protocol.WriteFrame(stream, protocol.DropChunkAck{OK: true}); err != nil {
+		if !m.serveOneChunk(ctx, normPeer, stream, defaultPtr) {
 			return
 		}
 	}
+}
+
+func (m *Manager) serveOneChunk(ctx context.Context, normPeer string, stream *quic.Stream, defaultPtr *[]byte) bool {
+	_ = stream.SetDeadline(time.Now().Add(streamDeadline))
+
+	var hdr protocol.DropChunkHeader
+	if err := protocol.ReadFrame(stream, &hdr); err != nil {
+		return false
+	}
+	if hdr.Size <= 0 || hdr.Size > chunker.MaxBlockSize || hdr.Size > protocol.MaxFrameSize {
+		_ = protocol.WriteFrame(stream, protocol.DropChunkAck{OK: false, Error: "invalid chunk size"})
+		return false
+	}
+
+	readLen := hdr.Size
+	if hdr.WireSize > 0 {
+		readLen = hdr.WireSize
+	}
+	if hdr.Compressed {
+		if readLen <= 0 || readLen > hdr.Size || readLen > protocol.MaxFrameSize {
+			_ = protocol.WriteFrame(stream, protocol.DropChunkAck{OK: false, Error: "invalid compressed wire size"})
+			return false
+		}
+	} else if readLen != hdr.Size {
+		_ = protocol.WriteFrame(stream, protocol.DropChunkAck{OK: false, Error: "invalid wire size"})
+		return false
+	}
+
+	var wireBuf []byte
+	if defaultPtr != nil && readLen <= cap(*defaultPtr) {
+		wireBuf = (*defaultPtr)[:readLen]
+	} else {
+		wirePtr := chunker.GetBufferSize(readLen)
+		defer chunker.PutBufferSized(wirePtr)
+		wireBuf = (*wirePtr)[:readLen]
+	}
+
+	if _, err := m.p2p.LimitedReadFull(ctx, stream, wireBuf); err != nil {
+		_ = protocol.WriteFrame(stream, protocol.DropChunkAck{OK: false, Error: err.Error()})
+		return false
+	}
+
+	rawBuf := wireBuf
+	if hdr.Compressed {
+		rawPtr := chunker.GetBufferSize(hdr.Size)
+		defer chunker.PutBufferSized(rawPtr)
+		dec, err := chunker.DecompressBlock(wireBuf, (*rawPtr)[:hdr.Size], hdr.Size)
+		if err != nil {
+			_ = protocol.WriteFrame(stream, protocol.DropChunkAck{OK: false, Error: "decompression failed"})
+			return false
+		}
+		rawBuf = dec
+	}
+
+	if hdr.Hash != "" && chunker.HashBytes(rawBuf) != hdr.Hash {
+		_ = protocol.WriteFrame(stream, protocol.DropChunkAck{OK: false, Error: "chunk hash mismatch"})
+		return false
+	}
+
+	destDir, ok := m.getActiveRecvDestDir(hdr.TransferID, normPeer)
+	if !ok {
+		_ = protocol.WriteFrame(stream, protocol.DropChunkAck{OK: false, Error: "transfer not active"})
+		return false
+	}
+
+	tmpPath, err := tempTransferPath(destDir, hdr.TransferID, hdr.RelPath)
+	if err != nil {
+		_ = protocol.WriteFrame(stream, protocol.DropChunkAck{OK: false, Error: err.Error()})
+		return false
+	}
+	if err := os.MkdirAll(filepath.Dir(tmpPath), 0755); err != nil {
+		_ = protocol.WriteFrame(stream, protocol.DropChunkAck{OK: false, Error: err.Error()})
+		return false
+	}
+
+	if err := m.handles.WriteAt(tmpPath, hdr.Offset, rawBuf); err != nil {
+		_ = protocol.WriteFrame(stream, protocol.DropChunkAck{OK: false, Error: "disk write error"})
+		return false
+	}
+	m.bytesRx.Add(uint64(len(rawBuf)))
+
+	m.recordRecvBlock(hdr.TransferID, hdr.RelPath, hdr.BlockIdx, int64(hdr.Size))
+	if err := protocol.WriteFrame(stream, protocol.DropChunkAck{OK: true}); err != nil {
+		return false
+	}
+	return true
 }
 
 func (m *Manager) getActiveRecvDestDir(transferID, normPeer string) (string, bool) {
@@ -1070,8 +1544,9 @@ func (m *Manager) HandleComplete(peerID string, raw json.RawMessage) {
 	if err := json.Unmarshal(raw, &msg); err != nil {
 		return
 	}
-	// Run verification and atomic rename asynchronously so the QUIC control loop never blocks on large hashes.
-	go m.handleCompleteAsync(peerID, msg)
+	m.launchBg(func() {
+		m.handleCompleteAsync(peerID, msg)
+	})
 }
 
 func (m *Manager) handleCompleteAsync(peerID string, msg protocol.DropCompleteMsg) {
@@ -1105,20 +1580,10 @@ func (m *Manager) handleCompleteAsync(peerID string, msg protocol.DropCompleteMs
 			return
 		}
 
-		// Verify file size & block completeness; only re-read entire file if blocks aren't all recorded
-		info, statErr := os.Stat(tmpPath)
-		if statErr != nil || info.Size() != entry.Size {
-			_ = m.store.UpdateDropStatusOnly(rec.TransferID, "failed", fmt.Sprintf("size mismatch for %s", entry.RelPath))
+		if err := verifyCompletedEntry(tmpPath, entry, rec.CompletedBlocks[entry.RelPath]); err != nil {
+			_ = m.store.UpdateDropStatusOnly(rec.TransferID, "failed", err.Error())
 			m.emitUpdateForce()
 			return
-		}
-		if len(rec.CompletedBlocks[entry.RelPath]) != len(entry.Blocks) {
-			_, actualHash, _, err := chunker.HashFileBlocks(tmpPath, chunker.DefaultBlockSize)
-			if err != nil || (entry.FileHash != "" && actualHash != entry.FileHash) {
-				_ = m.store.UpdateDropStatusOnly(rec.TransferID, "failed", fmt.Sprintf("integrity verification failed for %s", entry.RelPath))
-				m.emitUpdateForce()
-				return
-			}
 		}
 
 		if err := os.MkdirAll(filepath.Dir(finalPath), 0755); err != nil {
@@ -1139,8 +1604,141 @@ func (m *Manager) handleCompleteAsync(peerID string, msg protocol.DropCompleteMs
 	}
 
 	_ = m.store.UpdateDropProgress(rec.TransferID, "completed", "", rec.TotalSize, nil)
+	_ = m.store.PruneCompletedDropBlocks(rec.TransferID)
 	m.cleanupTransferMem(rec.TransferID)
 	m.emitUpdateForce()
+}
+
+func verifyCompletedEntry(tmpPath string, entry protocol.DropFileEntry, doneBlocks []int) error {
+	info, statErr := os.Stat(tmpPath)
+	if statErr != nil || info.Size() != entry.Size {
+		return fmt.Errorf("size mismatch for %s", entry.RelPath)
+	}
+
+	merkleMatch := entry.FileHash == "" || chunker.ComputeMerkleFileHash(entry.Blocks) == entry.FileHash
+	if len(doneBlocks) == len(entry.Blocks) && merkleMatch {
+		return nil
+	}
+
+	blkSize := entry.BlockSize
+	if blkSize <= 0 {
+		blkSize = chunker.AdaptiveBlockSize(entry.Size)
+	}
+	_, actualHash, _, err := chunker.HashFileBlocks(tmpPath, blkSize)
+	if err != nil || (entry.FileHash != "" && actualHash != entry.FileHash) {
+		return fmt.Errorf("integrity verification failed for %s", entry.RelPath)
+	}
+	return nil
+}
+
+func collectPathsForDrop(localPaths []string) ([]protocol.DropFileEntry, map[string]string, int64, int, error) {
+	var entries []protocol.DropFileEntry
+	srcMap := make(map[string]string)
+	usedRel := make(map[string]struct{})
+	var totalSize int64
+	var fileCount int
+
+	for _, rawPath := range localPaths {
+		cleanPath := filepath.Clean(rawPath)
+		info, err := os.Stat(cleanPath)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil, nil, 0, 0, fmt.Errorf("fichier introuvable sur cette machine (%s). Utilise le glisser-déposer ou 'Choisir des fichiers' si le fichier est sur un autre PC", cleanPath)
+			}
+			return nil, nil, 0, 0, fmt.Errorf("accès impossible à %s : %v", cleanPath, err)
+		}
+		baseName := filepath.Base(cleanPath)
+
+		if !info.IsDir() {
+			rel := ensureUniqueRelPath(filepath.ToSlash(baseName), usedRel)
+			sz := info.Size()
+			entries = append(entries, protocol.DropFileEntry{
+				RelPath:   rel,
+				Size:      sz,
+				IsDir:     false,
+				BlockSize: chunker.AdaptiveBlockSize(sz),
+			})
+			srcMap[rel] = cleanPath
+			totalSize += sz
+			fileCount++
+			continue
+		}
+
+		rootRel := ensureUniqueRelPath(filepath.ToSlash(baseName), usedRel)
+		err = filepath.WalkDir(cleanPath, func(cur string, d os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if d.Type()&os.ModeSymlink != 0 {
+				return nil
+			}
+			subRel, err := filepath.Rel(cleanPath, cur)
+			if err != nil {
+				return err
+			}
+			var rel string
+			if subRel == "." {
+				rel = rootRel
+			} else {
+				rel = path.Join(rootRel, filepath.ToSlash(subRel))
+			}
+			usedRel[rel] = struct{}{}
+			if d.IsDir() {
+				entries = append(entries, protocol.DropFileEntry{
+					RelPath: rel,
+					IsDir:   true,
+				})
+				return nil
+			}
+			fInfo, err := d.Info()
+			if err != nil {
+				return err
+			}
+			sz := fInfo.Size()
+			entries = append(entries, protocol.DropFileEntry{
+				RelPath:   rel,
+				Size:      sz,
+				IsDir:     false,
+				BlockSize: chunker.AdaptiveBlockSize(sz),
+			})
+			srcMap[rel] = cur
+			totalSize += sz
+			fileCount++
+			return nil
+		})
+		if err != nil {
+			return nil, nil, 0, 0, err
+		}
+	}
+
+	return entries, srcMap, totalSize, fileCount, nil
+}
+
+func ensureUniqueRelPath(rel string, used map[string]struct{}) string {
+	clean := strings.TrimLeft(rel, "/")
+	if clean == "" {
+		clean = "file"
+	}
+	if _, exists := used[clean]; !exists {
+		used[clean] = struct{}{}
+		return clean
+	}
+	dir := path.Dir(clean)
+	base := path.Base(clean)
+	ext := path.Ext(base)
+	stem := strings.TrimSuffix(base, ext)
+	for i := 1; i < 10000; i++ {
+		name := fmt.Sprintf("%s (%d)%s", stem, i, ext)
+		cand := name
+		if dir != "." {
+			cand = path.Join(dir, name)
+		}
+		if _, exists := used[cand]; !exists {
+			used[cand] = struct{}{}
+			return cand
+		}
+	}
+	return clean
 }
 
 func (m *Manager) loadSourceMap(rec *store.DropTransferRecord) map[string]string {
@@ -1251,15 +1849,6 @@ func safeJoin(root, rel string) (string, error) {
 		return "", fmt.Errorf("path escapes destination: %s", rel)
 	}
 	return full, nil
-}
-
-func containsInt(list []int, v int) bool {
-	for _, x := range list {
-		if x == v {
-			return true
-		}
-	}
-	return false
 }
 
 func newTransferID() string {

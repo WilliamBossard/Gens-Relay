@@ -483,28 +483,51 @@ pub fn run() {
                 }
             });
 
-            // Watchdog: restart relay-server sidecar if it exits unexpectedly
+            // Watchdog: restart relay-server sidecar ONLY on unexpected crash (code != 0) with exponential backoff.
             let watchdog_child = child_arc.clone();
             let watchdog_exit = exiting_arc.clone();
             std::thread::spawn(move || {
+                let mut consecutive_failures: u32 = 0;
+                let mut last_spawn = Instant::now();
                 loop {
-                    std::thread::sleep(Duration::from_secs(5));
+                    std::thread::sleep(Duration::from_secs(2));
                     if watchdog_exit.load(Ordering::SeqCst) {
                         break;
                     }
-                    let mut should_respawn = false;
+                    let mut crashed = false;
                     if let Ok(mut guard) = watchdog_child.lock() {
                         if let Some(ref mut child) = *guard {
-                            if let Ok(Some(_)) = child.try_wait() {
-                                *guard = None;
-                                should_respawn = true;
+                            match child.try_wait() {
+                                Ok(Some(status)) => {
+                                    *guard = None;
+                                    if status.success() {
+                                        watchdog_exit.store(true, Ordering::SeqCst);
+                                        consecutive_failures = 0;
+                                    } else {
+                                        crashed = true;
+                                    }
+                                }
+                                Ok(None) => {
+                                    if last_spawn.elapsed() > Duration::from_secs(30) {
+                                        consecutive_failures = 0;
+                                    }
+                                }
+                                Err(_) => {}
                             }
                         }
                     }
-                    if should_respawn && !watchdog_exit.load(Ordering::SeqCst) {
-                        if let Some(new_child) = spawn_relay_if_needed() {
-                            if let Ok(mut guard) = watchdog_child.lock() {
-                                *guard = Some(new_child);
+                    if crashed && !watchdog_exit.load(Ordering::SeqCst) {
+                        consecutive_failures += 1;
+                        if consecutive_failures <= 5 {
+                            let delay = (1u64 << (consecutive_failures - 1)).min(16);
+                            std::thread::sleep(Duration::from_secs(delay));
+                            if !watchdog_exit.load(Ordering::SeqCst) {
+                                if let Some(new_child) = spawn_relay_if_needed() {
+                                    last_spawn = Instant::now();
+                                    if let Ok(mut guard) = watchdog_child.lock() {
+                                        *guard = Some(new_child);
+                                    }
+                                }
                             }
                         }
                     }

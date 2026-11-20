@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sync"
 )
 
 // StreamKind tags the first byte of each QUIC stream so control and bulk data streams never block each other.
@@ -39,17 +40,19 @@ type ControlEnvelope struct {
 }
 
 const (
-	CtrlHello          = "hello"
-	CtrlFolderIndex    = "folder_index"
-	CtrlFolderSummary  = "folder_summary"
-	CtrlDropOffer      = "drop_offer"
-	CtrlDropResponse   = "drop_response"
-	CtrlDropPause      = "drop_pause"
-	CtrlDropResume     = "drop_resume"
-	CtrlDropCancel     = "drop_cancel"
-	CtrlDropComplete   = "drop_complete"
-	CtrlPing           = "ping"
-	CtrlPong           = "pong"
+	CtrlHello              = "hello"
+	CtrlFolderIndex        = "folder_index"
+	CtrlFolderSummary      = "folder_summary"
+	CtrlFolderInvite       = "folder_invite"
+	CtrlFolderInviteReject = "folder_invite_reject"
+	CtrlDropOffer          = "drop_offer"
+	CtrlDropResponse       = "drop_response"
+	CtrlDropPause          = "drop_pause"
+	CtrlDropResume         = "drop_resume"
+	CtrlDropCancel         = "drop_cancel"
+	CtrlDropComplete       = "drop_complete"
+	CtrlPing               = "ping"
+	CtrlPong               = "pong"
 )
 
 type HelloMsg struct {
@@ -67,34 +70,52 @@ type BlockInfo struct {
 }
 
 type FileMetadata struct {
-	RelPath  string      `json:"rel_path"`
-	Size     int64       `json:"size"`
-	MtimeNs  int64       `json:"mtime_ns"`
-	ModeBits uint32      `json:"mode_bits"`
-	IsDir    bool        `json:"is_dir"`
-	Deleted  bool        `json:"deleted"`
-	Version  VectorClock `json:"version"`
-	Blocks   []BlockInfo `json:"blocks,omitempty"`
-	FileHash string      `json:"file_hash,omitempty"`
-	Seq      int64       `json:"seq,omitempty"`
+	RelPath   string      `json:"rel_path"`
+	Size      int64       `json:"size"`
+	MtimeNs   int64       `json:"mtime_ns"`
+	ModeBits  uint32      `json:"mode_bits"`
+	IsDir     bool        `json:"is_dir"`
+	Deleted   bool        `json:"deleted"`
+	Version   VectorClock `json:"version"`
+	BlockSize int         `json:"block_size,omitempty"`
+	Blocks    []BlockInfo `json:"blocks,omitempty"`
+	FileHash  string      `json:"file_hash,omitempty"`
+	Seq       int64       `json:"seq,omitempty"`
 }
 
 type FolderIndexMsg struct {
 	FolderID     string         `json:"folder_id"`
 	Full         bool           `json:"full"`
 	MaxSeq       int64          `json:"max_seq,omitempty"`
+	IndexEpoch   uint64         `json:"index_epoch,omitempty"`
 	BatchID      string         `json:"batch_id,omitempty"`
 	BatchIndex   int            `json:"batch_index,omitempty"`
 	TotalBatches int            `json:"total_batches,omitempty"`
 	Files        []FileMetadata `json:"files"`
 }
 
-// FolderSummaryMsg is exchanged on reconnect so peers only send deltas since KnownSeq.
+// FolderSummaryMsg is exchanged on reconnect so peers only send deltas when epochs & counts match.
 type FolderSummaryMsg struct {
-	FolderID    string `json:"folder_id"`
-	KnownMaxSeq int64  `json:"known_max_seq"`
-	LocalMaxSeq int64  `json:"local_max_seq"`
-	FileCount   int    `json:"file_count"`
+	FolderID         string `json:"folder_id"`
+	KnownMaxSeq      int64  `json:"known_max_seq"`
+	KnownRemoteCount int    `json:"known_remote_count"`
+	KnownRemoteEpoch uint64 `json:"known_remote_epoch"`
+	LocalMaxSeq      int64  `json:"local_max_seq"`
+	LocalCount       int    `json:"local_count"`
+	LocalIndexEpoch  uint64 `json:"local_index_epoch"`
+}
+
+type FolderInviteMsg struct {
+	FolderID      string `json:"folder_id"`
+	Label         string `json:"label"`
+	SenderName    string `json:"sender_name"`
+	SuggestedMode string `json:"suggested_mode"`
+	FileCount     int    `json:"file_count"`
+	TotalBytes    int64  `json:"total_bytes"`
+}
+
+type FolderInviteRejectMsg struct {
+	FolderID string `json:"folder_id"`
 }
 
 // DataRequestKind distinguishes block downloads from Drop pushes on StreamData.
@@ -107,30 +128,35 @@ const (
 )
 
 type SyncBlockRequest struct {
-	FolderID string `json:"folder_id"`
-	RelPath  string `json:"rel_path"`
-	Offset   int64  `json:"offset"`
-	Size     int    `json:"size"`
-	Hash     string `json:"hash"`
+	FolderID   string `json:"folder_id"`
+	RelPath    string `json:"rel_path"`
+	Offset     int64  `json:"offset"`
+	Size       int    `json:"size"`
+	Hash       string `json:"hash"`
+	AcceptZstd bool   `json:"accept_zstd,omitempty"`
 }
 
 type SyncMultiBlockRequest struct {
-	FolderID string             `json:"folder_id"`
-	RelPath  string             `json:"rel_path"`
-	Blocks   []SyncBlockRequest `json:"blocks"`
+	FolderID   string             `json:"folder_id"`
+	RelPath    string             `json:"rel_path"`
+	AcceptZstd bool               `json:"accept_zstd,omitempty"`
+	Blocks     []SyncBlockRequest `json:"blocks"`
 }
 
 type SyncBlockResponse struct {
-	OK    bool   `json:"ok"`
-	Error string `json:"error,omitempty"`
+	OK         bool   `json:"ok"`
+	Error      string `json:"error,omitempty"`
+	Compressed bool   `json:"compressed,omitempty"`
+	WireSize   int    `json:"wire_size,omitempty"`
 }
 
 type DropFileEntry struct {
-	RelPath  string      `json:"rel_path"`
-	Size     int64       `json:"size"`
-	IsDir    bool        `json:"is_dir"`
-	Blocks   []BlockInfo `json:"blocks,omitempty"`
-	FileHash string      `json:"file_hash,omitempty"`
+	RelPath   string      `json:"rel_path"`
+	Size      int64       `json:"size"`
+	IsDir     bool        `json:"is_dir"`
+	BlockSize int         `json:"block_size,omitempty"`
+	Blocks    []BlockInfo `json:"blocks,omitempty"`
+	FileHash  string      `json:"file_hash,omitempty"`
 }
 
 type DropOfferMsg struct {
@@ -158,6 +184,8 @@ type DropChunkHeader struct {
 	Offset     int64  `json:"offset"`
 	Size       int    `json:"size"`
 	Hash       string `json:"hash"`
+	Compressed bool   `json:"compressed,omitempty"`
+	WireSize   int    `json:"wire_size,omitempty"`
 }
 
 type DropChunkAck struct {
@@ -179,7 +207,22 @@ type DropPauseMsg struct {
 	Reason     string `json:"reason,omitempty"`
 }
 
-// WriteFrame writes a length-prefixed JSON frame (DEFLATE-compressed when > 1 KiB).
+var flateWriterPool = sync.Pool{
+	New: func() any {
+		fw, _ := flate.NewWriter(io.Discard, flate.BestSpeed)
+		return fw
+	},
+}
+
+var frameBufPool = sync.Pool{
+	New: func() any {
+		b := new(bytes.Buffer)
+		b.Grow(4096)
+		return b
+	},
+}
+
+// WriteFrame writes a length-prefixed JSON frame (DEFLATE-compressed when > 1 KiB) in a single Write call.
 func WriteFrame(w io.Writer, v any) error {
 	data, err := json.Marshal(v)
 	if err != nil {
@@ -189,27 +232,43 @@ func WriteFrame(w io.Writer, v any) error {
 		return fmt.Errorf("frame too large: %d", len(data))
 	}
 
+	outBuf := frameBufPool.Get().(*bytes.Buffer)
+	outBuf.Reset()
+	defer func() {
+		if outBuf.Cap() <= 4*1024*1024 {
+			frameBufPool.Put(outBuf)
+		}
+	}()
+
 	headerLen := uint32(len(data))
 	payload := data
+	var compBuf *bytes.Buffer
 	if len(data) > 1024 {
-		var compBuf bytes.Buffer
-		fw, err := flate.NewWriter(&compBuf, flate.BestSpeed)
-		if err == nil {
-			if _, wErr := fw.Write(data); wErr == nil && fw.Close() == nil {
-				if compBuf.Len() < len(data) {
-					payload = compBuf.Bytes()
-					headerLen = uint32(len(payload)) | frameCompressedFlag
-				}
-			}
+		compBuf = frameBufPool.Get().(*bytes.Buffer)
+		compBuf.Reset()
+		fw := flateWriterPool.Get().(*flate.Writer)
+		fw.Reset(compBuf)
+		_, wErr := fw.Write(data)
+		cErr := fw.Close()
+		fw.Reset(io.Discard)
+		flateWriterPool.Put(fw)
+		if wErr == nil && cErr == nil && compBuf.Len() < len(data) {
+			payload = compBuf.Bytes()
+			headerLen = uint32(len(payload)) | frameCompressedFlag
 		}
 	}
 
 	var lenBuf [4]byte
 	binary.BigEndian.PutUint32(lenBuf[:], headerLen)
-	if _, err := w.Write(lenBuf[:]); err != nil {
-		return err
+	outBuf.Grow(4 + len(payload))
+	outBuf.Write(lenBuf[:])
+	outBuf.Write(payload)
+	if compBuf != nil {
+		if compBuf.Cap() <= 4*1024*1024 {
+			frameBufPool.Put(compBuf)
+		}
 	}
-	_, err = w.Write(payload)
+	_, err = w.Write(outBuf.Bytes())
 	return err
 }
 

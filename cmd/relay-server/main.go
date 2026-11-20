@@ -33,6 +33,8 @@ func main() {
 	maxRelayKBps := flag.Int("max-relay-kbps", envIntOr("MAX_RELAY_KBPS", 0), "Max blind relay bandwidth in KB/s (0 = unlimited)")
 	adminUser := flag.String("admin-user", os.Getenv("RELAY_ADMIN_USER"), "Admin Web UI username")
 	adminPass := flag.String("admin-pass", os.Getenv("RELAY_ADMIN_PASS"), "Admin Web UI password")
+	tlsCert := flag.String("tls-cert", os.Getenv("RELAY_TLS_CERT"), "Optional TLS certificate PEM path for WSS/HTTPS")
+	tlsKey := flag.String("tls-key", os.Getenv("RELAY_TLS_KEY"), "Optional TLS private key PEM path for WSS/HTTPS")
 	flag.Parse()
 
 	dataDir := *dataDirFlag
@@ -100,15 +102,22 @@ func main() {
 	}
 
 	if err := srv.StartUDP(ctx, snap.ListenAddr); err != nil {
-		log.Printf("[relay-server] UDP STUN listener disabled (%v)", err)
+		log.Printf("[relay-server] UDP STUN/Relay listener disabled (%v)", err)
 	} else {
-		log.Printf("[relay-server] UDP STUN listener active on %s", snap.ListenAddr)
+		log.Printf("[relay-server] UDP STUN & Native Blind Relay active on %s/udp", snap.ListenAddr)
 	}
 
+	useTLS := *tlsCert != "" && *tlsKey != ""
 	go func() {
-		log.Printf("[relay-server] Listening on %s (blind_relay=%v, stores_files=false)", snap.ListenAddr, snap.EnableBlindRelay)
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("[relay-server] fatal: %v", err)
+		log.Printf("[relay-server] Listening on %s (tls=%v, blind_relay=%v, stores_files=false)", snap.ListenAddr, useTLS, snap.EnableBlindRelay)
+		var sErr error
+		if useTLS {
+			sErr = httpServer.ListenAndServeTLS(*tlsCert, *tlsKey)
+		} else {
+			sErr = httpServer.ListenAndServe()
+		}
+		if sErr != nil && sErr != http.ErrServerClosed {
+			log.Fatalf("[relay-server] fatal: %v", sErr)
 		}
 	}()
 
@@ -120,12 +129,13 @@ func main() {
 			}
 		}()
 	} else {
-		log.Printf("[relay-server] Admin Web UI mounted at http://%s/admin/", snap.ListenAddr)
+		log.Printf("[relay-server] Admin Web UI mounted at %s/admin/", snap.ListenAddr)
 	}
 
 	<-ctx.Done()
 	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	srv.Shutdown(shutCtx)
 	_ = httpServer.Shutdown(shutCtx)
 	if adminServer != nil {
 		_ = adminServer.Shutdown(shutCtx)

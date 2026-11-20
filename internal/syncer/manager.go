@@ -3,6 +3,7 @@ package syncer
 import (
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,19 +27,22 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
+const streamIOTimeout = 30 * time.Second
+
 type FolderStatus struct {
-	FolderID       string `json:"folder_id"`
-	State          string `json:"state"` // "idle" | "scanning" | "syncing" | "paused" | "error"
-	LocalFiles     int    `json:"local_files"`
-	LocalBytes     int64  `json:"local_bytes"`
-	NeedFiles      int    `json:"need_files"`
-	NeedBytes      int64  `json:"need_bytes"`
-	RemoteDiverged int    `json:"remote_diverged"` // send_only: remote ahead
-	LocalChanges   int    `json:"local_changes"`   // receive_only: local modified
-	RxBps          int64  `json:"rx_bps"`
-	TxBps          int64  `json:"tx_bps"`
-	LastScanAt     int64  `json:"last_scan_at"`
-	LastError      string `json:"last_error,omitempty"`
+	FolderID       string   `json:"folder_id"`
+	State          string   `json:"state"` // "idle" | "scanning" | "syncing" | "paused" | "error"
+	LocalFiles     int      `json:"local_files"`
+	LocalBytes     int64    `json:"local_bytes"`
+	NeedFiles      int      `json:"need_files"`
+	NeedBytes      int64    `json:"need_bytes"`
+	RemoteDiverged int      `json:"remote_diverged"` // send_only: remote ahead
+	LocalChanges   int      `json:"local_changes"`   // receive_only: local modified/added
+	RxBps          int64    `json:"rx_bps"`
+	TxBps          int64    `json:"tx_bps"`
+	LastScanAt     int64    `json:"last_scan_at"`
+	LastError      string   `json:"last_error,omitempty"`
+	CaseCollisions []string `json:"case_collisions,omitempty"`
 }
 
 type indexBatchBuffer struct {
@@ -52,6 +57,18 @@ type watcherSpec struct {
 	cancel         context.CancelFunc
 }
 
+type scanJob struct {
+	full  bool
+	dirty map[string]struct{}
+}
+
+type folderByteCounter struct {
+	rx    atomic.Uint64
+	tx    atomic.Uint64
+	rxBps atomic.Int64
+	txBps atomic.Int64
+}
+
 type Manager struct {
 	myID    string
 	store   *store.Store
@@ -63,12 +80,18 @@ type Manager struct {
 	statuses       map[string]*FolderStatus
 	scanCh         map[string]chan struct{}
 	scanStop       map[string]context.CancelFunc
+	scanJobs       map[string]*scanJob
 	watchers       map[string]watcherSpec
 	pullMu         map[string]*sync.Mutex
 	pendingBatches map[string]*indexBatchBuffer
 	retryTimers    map[string]*time.Timer
 	retryAttempts  map[string]int
+	invitedSession map[string]bool
 	rootCtx        context.Context
+	workerWg       sync.WaitGroup
+
+	folderCntMu sync.RWMutex
+	folderCnts  map[string]*folderByteCounter
 
 	recentMu     sync.Mutex
 	recentWrites map[string]int64
@@ -89,11 +112,14 @@ func NewManager(myID string, st *store.Store, p2pMgr *p2p.Manager, onEmit func(s
 		statuses:       make(map[string]*FolderStatus),
 		scanCh:         make(map[string]chan struct{}),
 		scanStop:       make(map[string]context.CancelFunc),
+		scanJobs:       make(map[string]*scanJob),
 		watchers:       make(map[string]watcherSpec),
 		pullMu:         make(map[string]*sync.Mutex),
 		pendingBatches: make(map[string]*indexBatchBuffer),
 		retryTimers:    make(map[string]*time.Timer),
 		retryAttempts:  make(map[string]int),
+		invitedSession: make(map[string]bool),
+		folderCnts:     make(map[string]*folderByteCounter),
 		recentWrites:   make(map[string]int64),
 		rootCtx:        context.Background(),
 	}
@@ -103,21 +129,45 @@ func (m *Manager) TransferCounters() (rx, tx uint64) {
 	return m.bytesRx.Load(), m.bytesTx.Load()
 }
 
+func (m *Manager) getFolderCounter(folderID string) *folderByteCounter {
+	m.folderCntMu.RLock()
+	fc, ok := m.folderCnts[folderID]
+	m.folderCntMu.RUnlock()
+	if ok {
+		return fc
+	}
+	m.folderCntMu.Lock()
+	fc, ok = m.folderCnts[folderID]
+	if !ok {
+		fc = &folderByteCounter{}
+		m.folderCnts[folderID] = fc
+	}
+	m.folderCntMu.Unlock()
+	return fc
+}
+
+func (m *Manager) addFolderRx(folderID string, n uint64) {
+	m.bytesRx.Add(n)
+	m.getFolderCounter(folderID).rx.Add(n)
+}
+
+func (m *Manager) addFolderTx(folderID string, n uint64) {
+	m.bytesTx.Add(n)
+	m.getFolderCounter(folderID).tx.Add(n)
+}
+
 func (m *Manager) Start(ctx context.Context) {
 	m.rootCtx = ctx
 	m.ReloadFolders()
 
-	go func() {
-		<-ctx.Done()
-		m.handles.CloseAll()
-	}()
-
-	// Sample sync throughput every 1s for live UI speed badges
+	// Sample global + per-folder sync throughput every 1s for live UI speed badges
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 		prevRx := m.bytesRx.Load()
 		prevTx := m.bytesTx.Load()
+		prevFolder := make(map[string][2]uint64)
+
 		for {
 			select {
 			case <-ctx.Done():
@@ -131,7 +181,24 @@ func (m *Manager) Start(ctx context.Context) {
 				prevTx = curTx
 				oldRx := m.rxBps.Swap(dRx)
 				oldTx := m.txBps.Swap(dTx)
-				if dRx != oldRx || dTx != oldTx {
+
+				changed := dRx != oldRx || dTx != oldTx
+
+				m.folderCntMu.RLock()
+				for fid, fc := range m.folderCnts {
+					fRx := fc.rx.Load()
+					fTx := fc.tx.Load()
+					prev := prevFolder[fid]
+					dfRx := int64(fRx - prev[0])
+					dfTx := int64(fTx - prev[1])
+					prevFolder[fid] = [2]uint64{fRx, fTx}
+					if fc.rxBps.Swap(dfRx) != dfRx || fc.txBps.Swap(dfTx) != dfTx {
+						changed = true
+					}
+				}
+				m.folderCntMu.RUnlock()
+
+				if changed {
 					m.emitStatuses()
 				}
 			}
@@ -168,6 +235,36 @@ func (m *Manager) Start(ctx context.Context) {
 	}()
 }
 
+// Shutdown stops all watchers and folder workers, waits for completion up to ctx, and closes pooled file handles.
+func (m *Manager) Shutdown(ctx context.Context) {
+	m.mu.Lock()
+	for fid, spec := range m.watchers {
+		spec.cancel()
+		delete(m.watchers, fid)
+	}
+	for fid, stopFn := range m.scanStop {
+		stopFn()
+		delete(m.scanStop, fid)
+		delete(m.scanCh, fid)
+	}
+	for fid, t := range m.retryTimers {
+		t.Stop()
+		delete(m.retryTimers, fid)
+	}
+	m.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		m.workerWg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
+	m.handles.CloseAll()
+}
+
 func (m *Manager) ReloadFolders() {
 	folders, err := m.store.ListFolders()
 	if err != nil {
@@ -197,6 +294,7 @@ func (m *Manager) ReloadFolders() {
 			stopFn()
 			delete(m.scanStop, fid)
 			delete(m.scanCh, fid)
+			delete(m.scanJobs, fid)
 			if t, has := m.retryTimers[fid]; has {
 				t.Stop()
 				delete(m.retryTimers, fid)
@@ -210,20 +308,41 @@ func (m *Manager) ReloadFolders() {
 	m.mu.Unlock()
 
 	for _, f := range folders {
-		st := m.getOrCreateStatus(f.FolderID)
 		if f.Paused {
 			m.setStatusState(f.FolderID, "paused", "")
 			continue
 		}
+		m.mu.Lock()
+		st := m.getOrCreateStatusLocked(f.FolderID)
 		if st.State == "paused" {
-			m.setStatusState(f.FolderID, "idle", "")
+			st.State = "idle"
+			st.LastError = ""
 		}
+		// Reset session invite suppression on explicit folder config update
+		for _, pid := range f.Peers {
+			delete(m.invitedSession, f.FolderID+"|"+protocol.NormalizeDeviceID(pid))
+		}
+		m.mu.Unlock()
+
 		m.ensureWatcher(f)
 		m.TriggerScan(f.FolderID)
+		go m.sendFolderInvitesForFolder(f)
 	}
 }
 
 func (m *Manager) TriggerScan(folderID string) {
+	m.enqueueScan(folderID, true, nil)
+}
+
+func (m *Manager) TriggerPathsScan(folderID string, dirtyRelPaths []string) {
+	if len(dirtyRelPaths) == 0 {
+		m.TriggerScan(folderID)
+		return
+	}
+	m.enqueueScan(folderID, false, dirtyRelPaths)
+}
+
+func (m *Manager) enqueueScan(folderID string, full bool, dirty []string) {
 	m.mu.Lock()
 	ch, ok := m.scanCh[folderID]
 	if !ok {
@@ -231,7 +350,23 @@ func (m *Manager) TriggerScan(folderID string) {
 		wCtx, cancel := context.WithCancel(m.rootCtx)
 		m.scanCh[folderID] = ch
 		m.scanStop[folderID] = cancel
+		m.workerWg.Add(1)
 		go m.folderWorker(wCtx, folderID, ch)
+	}
+	job := m.scanJobs[folderID]
+	if job == nil {
+		job = &scanJob{dirty: make(map[string]struct{})}
+		m.scanJobs[folderID] = job
+	}
+	if full {
+		job.full = true
+	} else if !job.full {
+		for _, p := range dirty {
+			job.dirty[p] = struct{}{}
+		}
+		if len(job.dirty) > 500 {
+			job.full = true
+		}
 	}
 	m.mu.Unlock()
 
@@ -242,6 +377,7 @@ func (m *Manager) TriggerScan(folderID string) {
 }
 
 func (m *Manager) folderWorker(wCtx context.Context, folderID string, ch chan struct{}) {
+	defer m.workerWg.Done()
 	for {
 		select {
 		case <-wCtx.Done():
@@ -256,6 +392,23 @@ func (m *Manager) runScanAndSync(ctx context.Context, folderID string) {
 	mu := m.folderPullMutex(folderID)
 	mu.Lock()
 	defer mu.Unlock()
+
+	m.mu.Lock()
+	job := m.scanJobs[folderID]
+	full := true
+	var dirtyList []string
+	if job != nil {
+		full = job.full || len(job.dirty) == 0
+		if !full {
+			dirtyList = make([]string, 0, len(job.dirty))
+			for p := range job.dirty {
+				dirtyList = append(dirtyList, p)
+			}
+		}
+		job.full = false
+		job.dirty = make(map[string]struct{})
+	}
+	m.mu.Unlock()
 
 	f, err := m.store.GetFolder(folderID)
 	if err != nil {
@@ -274,7 +427,15 @@ func (m *Manager) runScanAndSync(ctx context.Context, folderID string) {
 		return
 	}
 
-	res, err := ScanFolder(f.LocalPath, m.myID, f.IgnorePatterns, prevIdx)
+	var res *ScanResult
+	if full || len(prevIdx) == 0 {
+		res, err = ScanFolder(f.LocalPath, m.myID, f.IgnorePatterns, prevIdx)
+		if err == nil && f.Versioning == "trashcan" && (f.TrashcanMaxDays > 0 || f.TrashcanMaxMB > 0) {
+			PruneTrashcan(f.LocalPath, f.TrashcanMaxDays, f.TrashcanMaxMB)
+		}
+	} else {
+		res, err = ScanPaths(f.LocalPath, m.myID, f.IgnorePatterns, dirtyList, prevIdx)
+	}
 	if err != nil {
 		m.setStatusState(folderID, "error", err.Error())
 		return
@@ -295,6 +456,7 @@ func (m *Manager) runScanAndSync(ctx context.Context, folderID string) {
 	st.LocalFiles = res.FileCount
 	st.LocalBytes = res.TotalSize
 	st.LastScanAt = time.Now().Unix()
+	st.CaseCollisions = res.CaseCollisions
 	m.mu.Unlock()
 
 	if len(res.Changed) > 0 {
@@ -304,12 +466,13 @@ func (m *Manager) runScanAndSync(ctx context.Context, folderID string) {
 	m.reconcileFolderLocked(ctx, *f)
 }
 
-func (m *Manager) sendFolderIndexBatched(peerID, folderID string, full bool, list []protocol.FileMetadata) {
+func (m *Manager) sendFolderIndexBatched(peerID, folderID string, full bool, indexEpoch uint64, list []protocol.FileMetadata) {
 	const maxFilesPerBatch = 350
 	if len(list) == 0 {
 		_ = m.p2p.SendControl(peerID, protocol.CtrlFolderIndex, protocol.FolderIndexMsg{
 			FolderID:     folderID,
 			Full:         full,
+			IndexEpoch:   indexEpoch,
 			BatchIndex:   0,
 			TotalBatches: 1,
 			Files:        list,
@@ -327,6 +490,7 @@ func (m *Manager) sendFolderIndexBatched(peerID, folderID string, full bool, lis
 		if err := m.p2p.SendControl(peerID, protocol.CtrlFolderIndex, protocol.FolderIndexMsg{
 			FolderID:     folderID,
 			Full:         full,
+			IndexEpoch:   indexEpoch,
 			BatchID:      batchID,
 			BatchIndex:   i,
 			TotalBatches: totalBatches,
@@ -338,6 +502,56 @@ func (m *Manager) sendFolderIndexBatched(peerID, folderID string, full bool, lis
 	}
 }
 
+func (m *Manager) sendFolderInvitesForFolder(f store.FolderRecord) {
+	if f.Paused {
+		return
+	}
+	for _, peerID := range f.Peers {
+		if m.p2p.IsConnected(peerID) {
+			m.maybeSendFolderInvite(peerID, f)
+		}
+	}
+}
+
+func (m *Manager) maybeSendFolderInvite(peerID string, f store.FolderRecord) {
+	peerID = protocol.NormalizeDeviceID(peerID)
+	key := f.FolderID + "|" + peerID
+	m.mu.Lock()
+	already := m.invitedSession[key]
+	if !already {
+		m.invitedSession[key] = true
+	}
+	m.mu.Unlock()
+	if already {
+		return
+	}
+
+	m.mu.RLock()
+	st := m.statuses[f.FolderID]
+	fileCount := 0
+	var totalBytes int64
+	if st != nil {
+		fileCount = st.LocalFiles
+		totalBytes = st.LocalBytes
+	}
+	m.mu.RUnlock()
+
+	suggested := string(protocol.ModeSendReceive)
+	if f.Mode == protocol.ModeSendOnly {
+		suggested = string(protocol.ModeReceiveOnly)
+	} else if f.Mode == protocol.ModeReceiveOnly {
+		suggested = string(protocol.ModeSendOnly)
+	}
+
+	_ = m.p2p.SendControl(peerID, protocol.CtrlFolderInvite, protocol.FolderInviteMsg{
+		FolderID:      f.FolderID,
+		Label:         f.Label,
+		SuggestedMode: suggested,
+		FileCount:     fileCount,
+		TotalBytes:    totalBytes,
+	})
+}
+
 func (m *Manager) OnPeerConnected(ctx context.Context, peerID string) {
 	folders, err := m.store.ListFolders()
 	if err != nil {
@@ -347,14 +561,18 @@ func (m *Manager) OnPeerConnected(ctx context.Context, peerID string) {
 		if f.Paused || !containsPeer(f.Peers, peerID) {
 			continue
 		}
-		knownRemoteSeq, _ := m.store.GetPeerRemoteMaxSeq(f.FolderID, peerID)
-		localMaxSeq, localCount, _ := m.store.GetLocalIndexSummary(f.FolderID)
+		knownRemoteSeq, knownRemoteCount, knownRemoteEpoch, _ := m.store.GetPeerRemoteSummary(f.FolderID, peerID)
+		localMaxSeq, localCount, localEpoch, _ := m.store.GetLocalIndexSummaryWithEpoch(f.FolderID)
 		_ = m.p2p.SendControl(peerID, protocol.CtrlFolderSummary, protocol.FolderSummaryMsg{
-			FolderID:    f.FolderID,
-			KnownMaxSeq: knownRemoteSeq,
-			LocalMaxSeq: localMaxSeq,
-			FileCount:   localCount,
+			FolderID:         f.FolderID,
+			KnownMaxSeq:      knownRemoteSeq,
+			KnownRemoteCount: knownRemoteCount,
+			KnownRemoteEpoch: knownRemoteEpoch,
+			LocalMaxSeq:      localMaxSeq,
+			LocalCount:       localCount,
+			LocalIndexEpoch:  localEpoch,
 		})
+		m.maybeSendFolderInvite(peerID, f)
 	}
 }
 
@@ -368,19 +586,24 @@ func (m *Manager) HandleFolderSummary(ctx context.Context, peerID string, raw js
 		return
 	}
 
-	localMaxSeq, localCount, err := m.store.GetLocalIndexSummary(f.FolderID)
+	m.mu.Lock()
+	m.invitedSession[f.FolderID+"|"+protocol.NormalizeDeviceID(peerID)] = true
+	m.mu.Unlock()
+
+	localMaxSeq, localCount, localEpoch, err := m.store.GetLocalIndexSummaryWithEpoch(f.FolderID)
 	if err != nil {
 		return
 	}
-	if msg.KnownMaxSeq > 0 && msg.KnownMaxSeq <= localMaxSeq && msg.FileCount == localCount {
+	// True delta check: compare peer's known count and epoch of OUR index against OUR local count and epoch
+	if msg.KnownMaxSeq > 0 && msg.KnownMaxSeq <= localMaxSeq &&
+		msg.KnownRemoteCount == localCount && msg.KnownRemoteEpoch == localEpoch {
 		if msg.KnownMaxSeq == localMaxSeq {
-			// Remote peer is already completely up to date; trigger local reconcile in case we need remote files.
 			go m.reconcileFolder(ctx, *f)
 			return
 		}
 		delta, err := m.store.GetLocalIndexSince(f.FolderID, msg.KnownMaxSeq)
 		if err == nil {
-			m.sendFolderIndexBatched(peerID, f.FolderID, false, delta)
+			m.sendFolderIndexBatched(peerID, f.FolderID, false, localEpoch, delta)
 			return
 		}
 	}
@@ -393,7 +616,7 @@ func (m *Manager) HandleFolderSummary(ctx context.Context, peerID string, raw js
 	for _, entry := range idx {
 		list = append(list, entry)
 	}
-	m.sendFolderIndexBatched(peerID, f.FolderID, true, list)
+	m.sendFolderIndexBatched(peerID, f.FolderID, true, localEpoch, list)
 }
 
 func (m *Manager) HandleFolderIndex(ctx context.Context, peerID string, raw json.RawMessage) {
@@ -406,6 +629,10 @@ func (m *Manager) HandleFolderIndex(ctx context.Context, peerID string, raw json
 		return
 	}
 
+	m.mu.Lock()
+	m.invitedSession[f.FolderID+"|"+protocol.NormalizeDeviceID(peerID)] = true
+	m.mu.Unlock()
+
 	filesToApply := msg.Files
 	if msg.TotalBatches > 1 && msg.BatchID != "" {
 		if msg.TotalBatches > 100000 || msg.BatchIndex < 0 || msg.BatchIndex >= msg.TotalBatches {
@@ -413,7 +640,6 @@ func (m *Manager) HandleFolderIndex(ctx context.Context, peerID string, raw json
 		}
 		key := fmt.Sprintf("%s|%s|%s", msg.FolderID, protocol.NormalizeDeviceID(peerID), msg.BatchID)
 		m.mu.Lock()
-		// Prune stale incomplete batches older than 5 minutes
 		cutoff := time.Now().Add(-5 * time.Minute)
 		for k, b := range m.pendingBatches {
 			if b.updated.Before(cutoff) {
@@ -449,11 +675,120 @@ func (m *Manager) HandleFolderIndex(ctx context.Context, peerID string, raw json
 		}
 	}
 
-	if err := m.store.UpsertRemoteFiles(msg.FolderID, peerID, msg.Full, filesToApply); err != nil {
+	if err := m.store.UpsertRemoteFilesWithEpoch(msg.FolderID, peerID, msg.Full, msg.IndexEpoch, filesToApply); err != nil {
 		return
 	}
 	if !f.Paused {
 		go m.reconcileFolder(ctx, *f)
+	}
+}
+
+func (m *Manager) HandleFolderInvite(peerID string, raw json.RawMessage) {
+	var msg protocol.FolderInviteMsg
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		return
+	}
+	if strings.TrimSpace(msg.FolderID) == "" {
+		return
+	}
+	normPeer := protocol.NormalizeDeviceID(peerID)
+	if !m.store.IsDeviceAllowed(normPeer) {
+		return
+	}
+	// If we already configure this folder locally, no invitation needed
+	if _, err := m.store.GetFolder(msg.FolderID); err == nil {
+		return
+	}
+
+	senderName := msg.SenderName
+	if dev, err := m.store.GetDevice(normPeer); err == nil && dev.Name != "" {
+		senderName = dev.Name
+	}
+	if senderName == "" {
+		senderName = normPeer
+	}
+	label := msg.Label
+	if label == "" {
+		label = msg.FolderID
+	}
+
+	_ = m.store.UpsertFolderInvitation(store.FolderInvitationRecord{
+		FolderID:      msg.FolderID,
+		SenderID:      normPeer,
+		SenderName:    senderName,
+		Label:         label,
+		SuggestedMode: msg.SuggestedMode,
+		FileCount:     msg.FileCount,
+		TotalBytes:    msg.TotalBytes,
+	})
+	m.emitInvitations()
+}
+
+func (m *Manager) HandleFolderInviteReject(peerID string, raw json.RawMessage) {
+	var msg protocol.FolderInviteRejectMsg
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		return
+	}
+	log.Printf("[syncer] Peer %s declined shared folder invitation %q", peerID, msg.FolderID)
+}
+
+func (m *Manager) AcceptInvitation(folderID, senderID, localPath string, mode protocol.FolderMode) error {
+	inv, err := m.store.GetFolderInvitation(folderID, senderID)
+	if err != nil {
+		return err
+	}
+	localPath = strings.TrimSpace(localPath)
+	if localPath == "" {
+		return errors.New("local_path is required")
+	}
+	if mode == "" {
+		if inv.SuggestedMode != "" {
+			mode = protocol.FolderMode(inv.SuggestedMode)
+		} else {
+			mode = protocol.ModeSendReceive
+		}
+	}
+	if err := os.MkdirAll(localPath, 0755); err != nil {
+		return err
+	}
+	if err := m.store.UpsertFolder(store.FolderRecord{
+		FolderID:        inv.FolderID,
+		Label:           inv.Label,
+		LocalPath:       localPath,
+		Mode:            mode,
+		Versioning:      "trashcan",
+		KeepVersions:    5,
+		RescanSeconds:   60,
+		MinFreeDiskMB:   500,
+		TrashcanMaxDays: 30,
+		Peers:           []string{inv.SenderID},
+	}); err != nil {
+		return err
+	}
+	_ = m.store.DeleteFolderInvitation(inv.FolderID, "")
+	m.emitInvitations()
+	m.ReloadFolders()
+	if m.p2p.IsConnected(inv.SenderID) {
+		go m.OnPeerConnected(m.rootCtx, inv.SenderID)
+	}
+	return nil
+}
+
+func (m *Manager) RejectInvitation(folderID, senderID string) error {
+	norm := protocol.NormalizeDeviceID(senderID)
+	if err := m.store.DeleteFolderInvitation(folderID, norm); err != nil {
+		return err
+	}
+	_ = m.p2p.SendControl(norm, protocol.CtrlFolderInviteReject, protocol.FolderInviteRejectMsg{FolderID: folderID})
+	m.emitInvitations()
+	return nil
+}
+
+func (m *Manager) emitInvitations() {
+	if m.onEmit != nil {
+		if invs, err := m.store.ListFolderInvitations(); err == nil {
+			m.onEmit("folder_invitations_updated", invs)
+		}
 	}
 }
 
@@ -465,7 +800,6 @@ func (m *Manager) reconcileFolder(ctx context.Context, f store.FolderRecord) {
 }
 
 func (m *Manager) reconcileFolderLocked(ctx context.Context, f store.FolderRecord) {
-
 	if f.Paused {
 		return
 	}
@@ -481,14 +815,14 @@ func (m *Manager) reconcileFolderLocked(ctx context.Context, f store.FolderRecor
 		conflict bool
 	}
 
-	// Build best remote candidate per RelPath across all peers so 3+ peer meshes don't overwrite or duplicate pulls.
 	type remoteCandidate struct {
 		peerID string
 		meta   protocol.FileMetadata
 	}
 	bestRemote := make(map[string]remoteCandidate)
 	for _, peerID := range f.Peers {
-		remoteIdx, err := m.store.GetRemoteIndex(f.FolderID, peerID)
+		// Use GetRemoteScanIndex (without blocks_json) to prevent RAM spikes on huge folders
+		remoteIdx, err := m.store.GetRemoteScanIndex(f.FolderID, peerID)
 		if err != nil {
 			continue
 		}
@@ -516,7 +850,9 @@ func (m *Manager) reconcileFolderLocked(ctx context.Context, f store.FolderRecor
 		}
 	}
 
-	var tasks []pullTask
+	var dirCreates []pullTask
+	var filePulls []pullTask
+	var deletions []pullTask
 	var remoteDiverged int
 	var localChanges int
 	var needBytes int64
@@ -530,21 +866,29 @@ func (m *Manager) reconcileFolderLocked(ctx context.Context, f store.FolderRecor
 			if rem.Deleted {
 				continue
 			}
-			relCmp = RelOlder // remote has file we never saw
+			relCmp = RelOlder
 		} else {
 			relCmp = CompareClocks(loc.Version, rem.Version)
 		}
 
+		addTask := func(t pullTask) {
+			if t.remote.Deleted {
+				deletions = append(deletions, t)
+			} else if t.remote.IsDir {
+				dirCreates = append(dirCreates, t)
+			} else {
+				filePulls = append(filePulls, t)
+				needBytes += t.remote.Size
+			}
+		}
+
 		switch relCmp {
-		case RelOlder: // remote strictly newer than local
+		case RelOlder:
 			if f.Mode == protocol.ModeSendOnly {
 				remoteDiverged++
 				continue
 			}
-			tasks = append(tasks, pullTask{peerID: peerID, remote: rem})
-			if !rem.Deleted && !rem.IsDir {
-				needBytes += rem.Size
-			}
+			addTask(pullTask{peerID: peerID, remote: rem})
 
 		case RelConflict:
 			if f.Mode == protocol.ModeSendOnly {
@@ -555,10 +899,7 @@ func (m *Manager) reconcileFolderLocked(ctx context.Context, f store.FolderRecor
 				localChanges++
 				continue
 			}
-			tasks = append(tasks, pullTask{peerID: peerID, remote: rem, conflict: true})
-			if !rem.Deleted && !rem.IsDir {
-				needBytes += rem.Size
-			}
+			addTask(pullTask{peerID: peerID, remote: rem, conflict: true})
 
 		case RelNewer:
 			if f.Mode == protocol.ModeReceiveOnly && hasLoc {
@@ -567,13 +908,27 @@ func (m *Manager) reconcileFolderLocked(ctx context.Context, f store.FolderRecor
 		}
 	}
 
+	// In receive_only mode, locally created files absent from all remote indexes also count as localChanges
+	if f.Mode == protocol.ModeReceiveOnly {
+		for rel, loc := range localIdx {
+			if loc.Deleted {
+				continue
+			}
+			if _, ok := bestRemote[rel]; !ok {
+				localChanges++
+			}
+		}
+	}
+
+	totalTasks := len(dirCreates) + len(filePulls) + len(deletions)
+
 	m.mu.Lock()
 	st := m.getOrCreateStatusLocked(f.FolderID)
-	st.NeedFiles = len(tasks)
+	st.NeedFiles = totalTasks
 	st.NeedBytes = needBytes
 	st.RemoteDiverged = remoteDiverged
 	st.LocalChanges = localChanges
-	if len(tasks) > 0 {
+	if totalTasks > 0 {
 		st.State = "syncing"
 	} else {
 		st.State = "idle"
@@ -583,12 +938,32 @@ func (m *Manager) reconcileFolderLocked(ctx context.Context, f store.FolderRecor
 	m.mu.Unlock()
 	m.emitStatuses()
 
-	if len(tasks) == 0 {
+	if totalTasks == 0 {
 		return
 	}
 
+	// Topological ordering prevents concurrent parent-dir delete vs child-file create races
+	sort.Slice(dirCreates, func(i, j int) bool {
+		di := strings.Count(dirCreates[i].remote.RelPath, "/")
+		dj := strings.Count(dirCreates[j].remote.RelPath, "/")
+		if di != dj {
+			return di < dj
+		}
+		return dirCreates[i].remote.RelPath < dirCreates[j].remote.RelPath
+	})
+	sort.Slice(deletions, func(i, j int) bool {
+		di := strings.Count(deletions[i].remote.RelPath, "/")
+		dj := strings.Count(deletions[j].remote.RelPath, "/")
+		if di != dj {
+			return di > dj
+		}
+		return deletions[i].remote.RelPath > deletions[j].remote.RelPath
+	})
+
 	var stateMu sync.Mutex
+	var pendingSave []protocol.FileMetadata
 	var pulled []protocol.FileMetadata
+	var lastSaveAt = time.Now()
 	var conflictCreated bool
 	var pullErrors int
 	var lastPullErr error
@@ -598,6 +973,35 @@ func (m *Manager) reconcileFolderLocked(ctx context.Context, f store.FolderRecor
 		rel, ok := localByHash[hash]
 		stateMu.Unlock()
 		return rel, ok
+	}
+
+	flushSaved := func(force bool) {
+		stateMu.Lock()
+		if len(pendingSave) == 0 || (!force && len(pendingSave) < 32 && time.Since(lastSaveAt) < 250*time.Millisecond) {
+			stateMu.Unlock()
+			return
+		}
+		batch := pendingSave
+		pendingSave = nil
+		lastSaveAt = time.Now()
+		stateMu.Unlock()
+
+		if uErr := m.store.UpsertLocalFiles(f.FolderID, batch); uErr != nil {
+			stateMu.Lock()
+			pullErrors++
+			lastPullErr = uErr
+			stateMu.Unlock()
+			return
+		}
+		stateMu.Lock()
+		pulled = append(pulled, batch...)
+		for _, saved := range batch {
+			localIdx[saved.RelPath] = saved
+			if !saved.Deleted && !saved.IsDir && saved.FileHash != "" && saved.Size > 0 {
+				localByHash[saved.FileHash] = saved.RelPath
+			}
+		}
+		stateMu.Unlock()
 	}
 
 	processTask := func(t pullTask) {
@@ -627,25 +1031,16 @@ func (m *Manager) reconcileFolderLocked(ctx context.Context, f store.FolderRecor
 			return
 		}
 		if updated != nil {
-			toSave := []protocol.FileMetadata{*updated}
-			if uErr := m.store.UpsertLocalFiles(f.FolderID, toSave); uErr != nil {
-				stateMu.Lock()
-				pullErrors++
-				lastPullErr = uErr
-				stateMu.Unlock()
-				return
-			}
-			saved := toSave[0]
 			stateMu.Lock()
-			pulled = append(pulled, saved)
-			localIdx[t.remote.RelPath] = saved
-			if !saved.Deleted && !saved.IsDir && saved.FileHash != "" && saved.Size > 0 {
-				localByHash[saved.FileHash] = saved.RelPath
-			}
+			pendingSave = append(pendingSave, *updated)
 			if madeConflict {
 				conflictCreated = true
 			}
+			needFlush := len(pendingSave) >= 32 || time.Since(lastSaveAt) >= 250*time.Millisecond
 			stateMu.Unlock()
+			if needFlush {
+				flushSaved(false)
+			}
 		}
 
 		m.mu.Lock()
@@ -662,33 +1057,47 @@ func (m *Manager) reconcileFolderLocked(ctx context.Context, f store.FolderRecor
 		m.emitStatuses()
 	}
 
-	// Parallelize file pulls (up to 4 concurrent files) so small-file sync isn't serialized per-RTT/fsync
-	workers := 4
-	if len(tasks) < workers {
-		workers = len(tasks)
+	// Phase 1: directory creations (top-down, sequential)
+	for _, t := range dirCreates {
+		processTask(t)
 	}
-	if workers <= 1 {
-		for _, t := range tasks {
-			processTask(t)
+
+	// Phase 2: file pulls (parallelized up to 4 concurrent files)
+	if len(filePulls) > 0 {
+		workers := 4
+		if len(filePulls) < workers {
+			workers = len(filePulls)
 		}
-	} else {
-		taskCh := make(chan pullTask, len(tasks))
-		for _, t := range tasks {
-			taskCh <- t
+		if workers <= 1 {
+			for _, t := range filePulls {
+				processTask(t)
+			}
+		} else {
+			taskCh := make(chan pullTask, len(filePulls))
+			for _, t := range filePulls {
+				taskCh <- t
+			}
+			close(taskCh)
+			var wg sync.WaitGroup
+			for i := 0; i < workers; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for t := range taskCh {
+						processTask(t)
+					}
+				}()
+			}
+			wg.Wait()
 		}
-		close(taskCh)
-		var wg sync.WaitGroup
-		for i := 0; i < workers; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for t := range taskCh {
-					processTask(t)
-				}
-			}()
-		}
-		wg.Wait()
 	}
+
+	// Phase 3: deletions (bottom-up, sequential)
+	for _, t := range deletions {
+		processTask(t)
+	}
+
+	flushSaved(true)
 
 	if len(pulled) > 0 {
 		m.broadcastIndexDelta(f, pulled)
@@ -754,6 +1163,10 @@ func (m *Manager) HandleControlMessage(ctx context.Context, peerID string, env p
 		m.HandleFolderSummary(ctx, peerID, env.Payload)
 	case protocol.CtrlFolderIndex:
 		m.HandleFolderIndex(ctx, peerID, env.Payload)
+	case protocol.CtrlFolderInvite:
+		m.HandleFolderInvite(peerID, env.Payload)
+	case protocol.CtrlFolderInviteReject:
+		m.HandleFolderInviteReject(peerID, env.Payload)
 	}
 }
 
@@ -798,11 +1211,11 @@ func (m *Manager) applyRemoteEntry(ctx context.Context, f store.FolderRecord, pe
 		return &res, nil
 	}
 
-	if err := m.pullFileContent(ctx, f, peerID, loc, rem, dstPath, lookupHash); err != nil {
+	hydrated, err := m.pullFileContent(ctx, f, peerID, loc, rem, dstPath, lookupHash)
+	if err != nil {
 		return nil, err
 	}
-	res := rem
-	return &res, nil
+	return &hydrated, nil
 }
 
 func (m *Manager) resolveAndPullConflict(ctx context.Context, f store.FolderRecord, peerID string, loc, rem protocol.FileMetadata, lookupHash func(string) (string, bool)) (*protocol.FileMetadata, bool, error) {
@@ -810,7 +1223,6 @@ func (m *Manager) resolveAndPullConflict(ctx context.Context, f store.FolderReco
 	merged := MergeClocks(loc.Version, rem.Version)
 
 	if remoteWins {
-		// Preserve our losing local version as a conflict file, then replace main path with winner
 		conflictCreated := false
 		if !loc.Deleted && !loc.IsDir {
 			src, err := safeJoin(f.LocalPath, loc.RelPath)
@@ -839,6 +1251,7 @@ func (m *Manager) resolveAndPullConflict(ctx context.Context, f store.FolderReco
 		if err != nil {
 			return nil, false, err
 		}
+		out := rem
 		if rem.Deleted {
 			m.handles.ClosePath(dstPath)
 			m.markRecentWrite(f.FolderID, dstPath)
@@ -856,18 +1269,16 @@ func (m *Manager) resolveAndPullConflict(ctx context.Context, f store.FolderReco
 				return nil, false, err
 			}
 		} else {
-			if err := m.pullFileContent(ctx, f, peerID, loc, rem, dstPath, lookupHash); err != nil {
+			hydrated, err := m.pullFileContent(ctx, f, peerID, loc, rem, dstPath, lookupHash)
+			if err != nil {
 				return nil, false, err
 			}
+			out = hydrated
 		}
-		out := rem
-		// Converge deterministically to merged clock without mutating peerID's counter
 		out.Version = merged
 		return &out, conflictCreated, nil
 	}
 
-	// Local wins: preserve remote's losing edit as a conflict copy before converging clock,
-	// so conflict copies are never lost regardless of which peer reconciles first.
 	conflictCreated := false
 	if !rem.Deleted && !rem.IsDir {
 		conflictRel := ConflictRelPath(rem.RelPath, peerID, rem.MtimeNs)
@@ -876,7 +1287,7 @@ func (m *Manager) resolveAndPullConflict(ctx context.Context, f store.FolderReco
 			return nil, false, err
 		}
 		if _, statErr := os.Stat(conflictDst); os.IsNotExist(statErr) {
-			if err := m.pullFileContent(ctx, f, peerID, protocol.FileMetadata{}, rem, conflictDst, lookupHash); err != nil {
+			if _, err := m.pullFileContent(ctx, f, peerID, protocol.FileMetadata{}, rem, conflictDst, lookupHash); err != nil {
 				return nil, false, err
 			}
 			conflictCreated = true
@@ -887,9 +1298,19 @@ func (m *Manager) resolveAndPullConflict(ctx context.Context, f store.FolderReco
 	return &out, conflictCreated, nil
 }
 
-func (m *Manager) pullFileContent(ctx context.Context, f store.FolderRecord, peerID string, loc, rem protocol.FileMetadata, dstPath string, lookupHash func(string) (string, bool)) error {
+func (m *Manager) pullFileContent(ctx context.Context, f store.FolderRecord, peerID string, loc, rem protocol.FileMetadata, dstPath string, lookupHash func(string) (string, bool)) (protocol.FileMetadata, error) {
 	if err := os.MkdirAll(filepath.Dir(dstPath), 0755); err != nil {
-		return err
+		return rem, err
+	}
+
+	// Lazy-load remote blocks only for files we are actually pulling
+	if rem.Size > 0 && len(rem.Blocks) == 0 {
+		if blocks, bs, bErr := m.store.GetRemoteFileBlocks(f.FolderID, peerID, rem.RelPath); bErr == nil {
+			rem.Blocks = blocks
+			if rem.BlockSize == 0 {
+				rem.BlockSize = bs
+			}
+		}
 	}
 
 	// Fast metadata-only convergence if local file already has exact identical content hash & size
@@ -903,14 +1324,24 @@ func (m *Manager) pullFileContent(ctx context.Context, f store.FolderRecord, pee
 				t := time.Unix(0, rem.MtimeNs)
 				_ = os.Chtimes(dstPath, t, t)
 			}
-			return nil
+			return rem, nil
+		}
+	}
+
+	// Free disk space guard
+	if f.MinFreeDiskMB > 0 && rem.Size > 0 {
+		if avail, err := AvailableDiskBytes(f.LocalPath); err == nil {
+			need := uint64(f.MinFreeDiskMB)*1024*1024 + uint64(rem.Size)
+			if avail < need {
+				return rem, fmt.Errorf("espace disque insuffisant pour %s (%d Mo libres, %d Mo requis)", rem.RelPath, avail/(1024*1024), need/(1024*1024))
+			}
 		}
 	}
 
 	tmpPath := filepath.Join(filepath.Dir(dstPath), fmt.Sprintf(".%s.gens.tmp.%s", filepath.Base(dstPath), randomHex(6)))
 	tmpFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
-		return err
+		return rem, err
 	}
 	cleanupTmp := true
 	defer func() {
@@ -920,7 +1351,6 @@ func (m *Manager) pullFileContent(ctx context.Context, f store.FolderRecord, pee
 		}
 	}()
 
-	// Rename/move local deduplication: if exact FileHash already exists locally, copy locally without network transfer.
 	copiedLocal := false
 	if rem.FileHash != "" && rem.Size > 0 && lookupHash != nil {
 		if srcRel, ok := lookupHash(rem.FileHash); ok {
@@ -940,12 +1370,13 @@ func (m *Manager) pullFileContent(ctx context.Context, f store.FolderRecord, pee
 	}
 
 	if !copiedLocal {
-		// Pre-allocate destination size for multi-block files to minimize NTFS/ext4/ZFS fragmentation
+		if rem.Size > 0 && len(rem.Blocks) == 0 {
+			return rem, fmt.Errorf("missing block metadata for %s", rem.RelPath)
+		}
 		if rem.Size > chunker.DefaultBlockSize {
 			_ = tmpFile.Truncate(rem.Size)
 		}
 
-		// Build reusable local block map (lazy-loading blocks_json only when pulling a modified file)
 		localBlocks := make(map[string]protocol.BlockInfo)
 		if info, sErr := os.Stat(dstPath); sErr == nil && !info.IsDir() {
 			if len(loc.Blocks) == 0 && !loc.Deleted && !loc.IsDir && loc.Size == info.Size() && loc.Size > 0 {
@@ -957,7 +1388,7 @@ func (m *Manager) pullFileContent(ctx context.Context, f store.FolderRecord, pee
 				for _, b := range loc.Blocks {
 					localBlocks[b.Hash] = b
 				}
-			} else if existingBlocks, _, _, hErr := chunker.HashFileBlocks(dstPath, chunker.DefaultBlockSize); hErr == nil {
+			} else if existingBlocks, _, _, hErr := chunker.HashFileBlocks(dstPath, rem.BlockSize); hErr == nil {
 				for _, b := range existingBlocks {
 					localBlocks[b.Hash] = b
 				}
@@ -973,30 +1404,41 @@ func (m *Manager) pullFileContent(ctx context.Context, f store.FolderRecord, pee
 		}
 
 		var missing []protocol.BlockInfo
-		bufPtr := chunker.GetBuffer()
 		for _, blk := range rem.Blocks {
 			var reused bool
 			if oldFile != nil {
-				if lb, ok := localBlocks[blk.Hash]; ok && lb.Size == blk.Size && lb.Size <= len(*bufPtr) {
+				if lb, ok := localBlocks[blk.Hash]; ok && lb.Size == blk.Size {
+					bufPtr := chunker.GetBufferSize(lb.Size)
 					buf := (*bufPtr)[:lb.Size]
-					if n, rErr := oldFile.ReadAt(buf, lb.Offset); rErr == nil && n == lb.Size && chunker.HashBytes(buf) == blk.Hash {
+					if n, rErr := oldFile.ReadAt(buf, lb.Offset); (rErr == nil || rErr == io.EOF) && n == lb.Size && chunker.HashBytes(buf) == blk.Hash {
 						if _, wErr := tmpFile.WriteAt(buf, blk.Offset); wErr != nil {
-							chunker.PutBuffer(bufPtr)
-							return wErr
+							chunker.PutBufferSized(bufPtr)
+							return rem, wErr
 						}
 						reused = true
 					}
+					chunker.PutBufferSized(bufPtr)
 				}
 			}
 			if !reused {
 				missing = append(missing, blk)
 			}
 		}
-		chunker.PutBuffer(bufPtr)
 
 		if len(missing) > 0 {
-			// Batch up to 8 blocks per QUIC stream to eliminate per-block RTT/open-stream overhead
-			const batchSize = 8
+			// Cap batch payload budget around 4 MiB so large adaptive blocks (4-16 MiB) don't over-buffer
+			blkSz := rem.BlockSize
+			if blkSz <= 0 {
+				blkSz = chunker.DefaultBlockSize
+			}
+			batchSize := (4 * 1024 * 1024) / blkSz
+			if batchSize < 1 {
+				batchSize = 1
+			}
+			if batchSize > 8 {
+				batchSize = 8
+			}
+
 			var batches [][]protocol.BlockInfo
 			for i := 0; i < len(missing); i += batchSize {
 				end := i + batchSize
@@ -1030,11 +1472,11 @@ func (m *Manager) pullFileContent(ctx context.Context, f store.FolderRecord, pee
 						if pullCtx.Err() != nil {
 							return
 						}
-						fErr := m.fetchRemoteBlockBatch(pullCtx, peerID, f.FolderID, rem.RelPath, batch, func(blk protocol.BlockInfo, data []byte) error {
+						fErr := m.fetchRemoteBlockBatch(pullCtx, peerID, f.FolderID, rem.RelPath, batch, func(blk protocol.BlockInfo, data []byte, wireLen int) error {
 							if _, wErr := tmpFile.WriteAt(data, blk.Offset); wErr != nil {
 								return wErr
 							}
-							m.bytesRx.Add(uint64(len(data)))
+							m.addFolderRx(f.FolderID, uint64(wireLen))
 							return nil
 						})
 						if fErr != nil {
@@ -1049,7 +1491,7 @@ func (m *Manager) pullFileContent(ctx context.Context, f store.FolderRecord, pee
 			}
 			wg.Wait()
 			if firstErr != nil {
-				return firstErr
+				return rem, firstErr
 			}
 		}
 
@@ -1058,23 +1500,27 @@ func (m *Manager) pullFileContent(ctx context.Context, f store.FolderRecord, pee
 		}
 	}
 
+	// Zero-re-read Merkle verification: all blocks are already BLAKE3 verified on reuse/receipt
+	if rem.Size > 0 && len(rem.Blocks) > 0 {
+		var covered int64
+		for _, b := range rem.Blocks {
+			covered += int64(b.Size)
+		}
+		if covered != rem.Size {
+			return rem, fmt.Errorf("block coverage mismatch for %s: %d != %d", rem.RelPath, covered, rem.Size)
+		}
+		if rem.FileHash != "" && chunker.ComputeMerkleFileHash(rem.Blocks) != rem.FileHash {
+			return rem, fmt.Errorf("merkle file hash mismatch for %s", rem.RelPath)
+		}
+	}
+
 	if err := tmpFile.Truncate(rem.Size); err != nil {
-		return err
+		return rem, err
 	}
 	if err := tmpFile.Sync(); err != nil {
-		return err
+		return rem, err
 	}
 	_ = tmpFile.Close()
-
-	if rem.Size > 0 {
-		_, actualHash, _, err := chunker.HashFileBlocks(tmpPath, chunker.DefaultBlockSize)
-		if err != nil {
-			return err
-		}
-		if rem.FileHash != "" && actualHash != rem.FileHash {
-			return fmt.Errorf("file hash mismatch after transfer for %s", rem.RelPath)
-		}
-	}
 
 	if runtime.GOOS != "windows" && rem.ModeBits != 0 {
 		_ = os.Chmod(tmpPath, os.FileMode(rem.ModeBits))
@@ -1087,16 +1533,20 @@ func (m *Manager) pullFileContent(ctx context.Context, f store.FolderRecord, pee
 	m.handles.ClosePath(dstPath)
 	m.markRecentWrite(f.FolderID, dstPath)
 
-	// Transactional replacement: back up existing dstPath before rename so dstPath is never lost if rename fails.
 	var bakPath string
 	shouldArchive := dstPath == filepath.Join(f.LocalPath, filepath.FromSlash(rem.RelPath))
 	if info, sErr := os.Stat(dstPath); sErr == nil {
 		if info.IsDir() {
-			_ = os.RemoveAll(dstPath)
+			// Respect versioning policy when a remote file replaces an existing directory
+			if shouldArchive {
+				_ = ArchiveFile(f.LocalPath, rem.RelPath, f.Versioning, f.KeepVersions)
+			} else {
+				_ = os.RemoveAll(dstPath)
+			}
 		} else if shouldArchive {
 			bakPath = filepath.Join(filepath.Dir(dstPath), fmt.Sprintf(".%s.gens.bak.%s", filepath.Base(dstPath), randomHex(6)))
 			if err := os.Rename(dstPath, bakPath); err != nil {
-				return err
+				return rem, err
 			}
 		}
 	}
@@ -1104,24 +1554,24 @@ func (m *Manager) pullFileContent(ctx context.Context, f store.FolderRecord, pee
 		if bakPath != "" {
 			_ = os.Rename(bakPath, dstPath)
 		}
-		return err
+		return rem, err
 	}
 	cleanupTmp = false
 	if bakPath != "" {
 		_ = ArchiveSourceFile(f.LocalPath, rem.RelPath, bakPath, f.Versioning, f.KeepVersions)
 	}
-	return nil
+	return rem, nil
 }
 
-func (m *Manager) fetchRemoteBlockBatch(ctx context.Context, peerID, folderID, relPath string, batch []protocol.BlockInfo, onBlock func(protocol.BlockInfo, []byte) error) error {
+func (m *Manager) fetchRemoteBlockBatch(ctx context.Context, peerID, folderID, relPath string, batch []protocol.BlockInfo, onBlock func(protocol.BlockInfo, []byte, int) error) error {
 	if len(batch) == 1 {
-		data, ptr, err := m.fetchRemoteBlock(ctx, peerID, folderID, relPath, batch[0])
+		data, ptr, wireLen, err := m.fetchRemoteBlock(ctx, peerID, folderID, relPath, batch[0])
 		if err != nil {
 			return err
 		}
-		wErr := onBlock(batch[0], data)
+		wErr := onBlock(batch[0], data, wireLen)
 		if ptr != nil {
-			chunker.PutBuffer(ptr)
+			chunker.PutBufferSized(ptr)
 		}
 		return wErr
 	}
@@ -1130,6 +1580,12 @@ func (m *Manager) fetchRemoteBlockBatch(ctx context.Context, peerID, folderID, r
 	if err != nil {
 		return err
 	}
+	stopCancel := context.AfterFunc(ctx, func() {
+		stream.CancelRead(1)
+		stream.CancelWrite(1)
+		_ = stream.Close()
+	})
+	defer stopCancel()
 	defer release()
 	defer stream.Close()
 
@@ -1143,15 +1599,18 @@ func (m *Manager) fetchRemoteBlockBatch(ctx context.Context, peerID, folderID, r
 			Hash:     blk.Hash,
 		}
 	}
+	_ = stream.SetDeadline(time.Now().Add(streamIOTimeout))
 	if err := protocol.WriteFrame(stream, protocol.SyncMultiBlockRequest{
-		FolderID: folderID,
-		RelPath:  relPath,
-		Blocks:   reqs,
+		FolderID:   folderID,
+		RelPath:    relPath,
+		AcceptZstd: m.p2p.CompressionEnabled(),
+		Blocks:     reqs,
 	}); err != nil {
 		return err
 	}
 
 	var resp protocol.SyncBlockResponse
+	_ = stream.SetDeadline(time.Now().Add(streamIOTimeout))
 	if err := protocol.ReadFrame(stream, &resp); err != nil {
 		return err
 	}
@@ -1159,83 +1618,144 @@ func (m *Manager) fetchRemoteBlockBatch(ctx context.Context, peerID, folderID, r
 		return errors.New(resp.Error)
 	}
 
-	bufPtr := chunker.GetBuffer()
-	defer chunker.PutBuffer(bufPtr)
-
+	var hdr [5]byte
 	for _, blk := range batch {
-		var buf []byte
-		if blk.Size <= chunker.DefaultBlockSize {
-			buf = (*bufPtr)[:blk.Size]
-		} else {
-			buf = make([]byte, blk.Size)
-		}
-		if _, err := m.p2p.LimitedReadFull(ctx, stream, buf); err != nil {
+		_ = stream.SetDeadline(time.Now().Add(streamIOTimeout))
+		if _, err := io.ReadFull(stream, hdr[:]); err != nil {
 			return err
 		}
-		if blk.Hash != "" && chunker.HashBytes(buf) != blk.Hash {
+		compressed := (hdr[0] & 0x01) != 0
+		wireLen := int(binary.BigEndian.Uint32(hdr[1:5]))
+		if wireLen <= 0 || wireLen > chunker.MaxBlockSize+1024*1024 {
+			return fmt.Errorf("invalid multi-block wire size: %d", wireLen)
+		}
+
+		wirePtr := chunker.GetBufferSize(wireLen)
+		wireBuf := (*wirePtr)[:wireLen]
+		if _, err := m.p2p.LimitedReadFull(ctx, stream, wireBuf); err != nil {
+			chunker.PutBufferSized(wirePtr)
+			return err
+		}
+
+		var rawBuf []byte
+		var rawPtr *[]byte
+		if compressed {
+			rawPtr = chunker.GetBufferSize(blk.Size)
+			dec, dErr := chunker.DecompressBlock(wireBuf, (*rawPtr)[:0], blk.Size)
+			chunker.PutBufferSized(wirePtr)
+			if dErr != nil {
+				chunker.PutBufferSized(rawPtr)
+				return dErr
+			}
+			rawBuf = dec
+		} else {
+			if wireLen != blk.Size {
+				chunker.PutBufferSized(wirePtr)
+				return fmt.Errorf("uncompressed block size mismatch: %d != %d", wireLen, blk.Size)
+			}
+			rawPtr = wirePtr
+			rawBuf = wireBuf
+		}
+
+		if blk.Hash != "" && chunker.HashBytes(rawBuf) != blk.Hash {
+			chunker.PutBufferSized(rawPtr)
 			return fmt.Errorf("corrupted block hash from %s", peerID)
 		}
-		if err := onBlock(blk, buf); err != nil {
+		err := onBlock(blk, rawBuf, wireLen)
+		chunker.PutBufferSized(rawPtr)
+		if err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (m *Manager) fetchRemoteBlock(ctx context.Context, peerID, folderID, relPath string, blk protocol.BlockInfo) ([]byte, *[]byte, error) {
+func (m *Manager) fetchRemoteBlock(ctx context.Context, peerID, folderID, relPath string, blk protocol.BlockInfo) ([]byte, *[]byte, int, error) {
 	stream, release, err := m.p2p.OpenTrackedDataStream(ctx, peerID, protocol.DataReqSyncBlock)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
+	stopCancel := context.AfterFunc(ctx, func() {
+		stream.CancelRead(1)
+		stream.CancelWrite(1)
+		_ = stream.Close()
+	})
+	defer stopCancel()
 	defer release()
 	defer stream.Close()
 
 	req := protocol.SyncBlockRequest{
-		FolderID: folderID,
-		RelPath:  relPath,
-		Offset:   blk.Offset,
-		Size:     blk.Size,
-		Hash:     blk.Hash,
+		FolderID:   folderID,
+		RelPath:    relPath,
+		Offset:     blk.Offset,
+		Size:       blk.Size,
+		Hash:       blk.Hash,
+		AcceptZstd: m.p2p.CompressionEnabled(),
 	}
+	_ = stream.SetDeadline(time.Now().Add(streamIOTimeout))
 	if err := protocol.WriteFrame(stream, req); err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 
 	var resp protocol.SyncBlockResponse
+	_ = stream.SetDeadline(time.Now().Add(streamIOTimeout))
 	if err := protocol.ReadFrame(stream, &resp); err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 	if !resp.OK {
-		return nil, nil, errors.New(resp.Error)
+		return nil, nil, 0, errors.New(resp.Error)
 	}
 
-	var bufPtr *[]byte
-	var buf []byte
-	if blk.Size <= chunker.DefaultBlockSize {
-		bufPtr = chunker.GetBuffer()
-		buf = (*bufPtr)[:blk.Size]
+	wireLen := blk.Size
+	if resp.Compressed && resp.WireSize > 0 {
+		wireLen = resp.WireSize
+	}
+	if wireLen <= 0 || wireLen > chunker.MaxBlockSize+1024*1024 {
+		return nil, nil, 0, fmt.Errorf("invalid wire size: %d", wireLen)
+	}
+
+	wirePtr := chunker.GetBufferSize(wireLen)
+	wireBuf := (*wirePtr)[:wireLen]
+	_ = stream.SetDeadline(time.Now().Add(streamIOTimeout))
+	if _, err := m.p2p.LimitedReadFull(ctx, stream, wireBuf); err != nil {
+		chunker.PutBufferSized(wirePtr)
+		return nil, nil, 0, err
+	}
+
+	var rawBuf []byte
+	var rawPtr *[]byte
+	if resp.Compressed {
+		rawPtr = chunker.GetBufferSize(blk.Size)
+		dec, dErr := chunker.DecompressBlock(wireBuf, (*rawPtr)[:0], blk.Size)
+		chunker.PutBufferSized(wirePtr)
+		if dErr != nil {
+			chunker.PutBufferSized(rawPtr)
+			return nil, nil, 0, dErr
+		}
+		rawBuf = dec
 	} else {
-		buf = make([]byte, blk.Size)
+		rawPtr = wirePtr
+		rawBuf = wireBuf
 	}
-	if _, err := m.p2p.LimitedReadFull(ctx, stream, buf); err != nil {
-		if bufPtr != nil {
-			chunker.PutBuffer(bufPtr)
-		}
-		return nil, nil, err
+
+	if blk.Hash != "" && chunker.HashBytes(rawBuf) != blk.Hash {
+		chunker.PutBufferSized(rawPtr)
+		return nil, nil, 0, fmt.Errorf("corrupted block hash from %s", peerID)
 	}
-	if blk.Hash != "" && chunker.HashBytes(buf) != blk.Hash {
-		if bufPtr != nil {
-			chunker.PutBuffer(bufPtr)
-		}
-		return nil, nil, fmt.Errorf("corrupted block hash from %s", peerID)
-	}
-	return buf, bufPtr, nil
+	return rawBuf, rawPtr, wireLen, nil
 }
 
-// ServeBlockStream serves a peer's request for a single block of a synced folder.
+// ServeBlockStream serves a peer's request for a single block using the pooled FileHandleCache.
 func (m *Manager) ServeBlockStream(ctx context.Context, peerID string, stream *quic.Stream) {
 	defer stream.Close()
+	stopCancel := context.AfterFunc(ctx, func() {
+		stream.CancelRead(1)
+		stream.CancelWrite(1)
+		_ = stream.Close()
+	})
+	defer stopCancel()
 
+	_ = stream.SetDeadline(time.Now().Add(streamIOTimeout))
 	var req protocol.SyncBlockRequest
 	if err := protocol.ReadFrame(stream, &req); err != nil {
 		return
@@ -1252,34 +1772,50 @@ func (m *Manager) ServeBlockStream(ctx context.Context, peerID string, stream *q
 		_ = protocol.WriteFrame(stream, protocol.SyncBlockResponse{OK: false, Error: "invalid path"})
 		return
 	}
-
-	var bufPtr *[]byte
-	var data []byte
-	if req.Size > 0 && req.Size <= chunker.DefaultBlockSize {
-		bufPtr = chunker.GetBuffer()
-		defer chunker.PutBuffer(bufPtr)
-		data = (*bufPtr)[:req.Size]
-		err = chunker.ReadBlockInto(fullPath, req.Offset, req.Size, req.Hash, data)
-	} else {
-		data, err = chunker.ReadBlock(fullPath, req.Offset, req.Size, req.Hash)
+	if req.Size <= 0 || req.Size > chunker.MaxBlockSize {
+		_ = protocol.WriteFrame(stream, protocol.SyncBlockResponse{OK: false, Error: "invalid block size"})
+		return
 	}
-	if err != nil {
+
+	bufPtr := chunker.GetBufferSize(req.Size)
+	defer chunker.PutBufferSized(bufPtr)
+	data := (*bufPtr)[:req.Size]
+	if err := chunker.ReadBlockInto(fullPath, req.Offset, req.Size, req.Hash, data); err != nil {
 		_ = protocol.WriteFrame(stream, protocol.SyncBlockResponse{OK: false, Error: err.Error()})
 		return
 	}
 
-	if err := protocol.WriteFrame(stream, protocol.SyncBlockResponse{OK: true}); err != nil {
+	wireData := data
+	compressed := false
+	if req.AcceptZstd {
+		wireData, compressed = chunker.CompressBlockIfWorthwhile(req.RelPath, data)
+	}
+
+	_ = stream.SetDeadline(time.Now().Add(streamIOTimeout))
+	if err := protocol.WriteFrame(stream, protocol.SyncBlockResponse{
+		OK:         true,
+		Compressed: compressed,
+		WireSize:   len(wireData),
+	}); err != nil {
 		return
 	}
-	if _, err := m.p2p.LimitedWrite(ctx, stream, data); err == nil {
-		m.bytesTx.Add(uint64(len(data)))
+	_ = stream.SetDeadline(time.Now().Add(streamIOTimeout))
+	if _, err := m.p2p.LimitedWrite(ctx, stream, wireData); err == nil {
+		m.addFolderTx(req.FolderID, uint64(len(wireData)))
 	}
 }
 
-// ServeMultiBlockStream serves multiple blocks of a file sequentially over one QUIC stream.
+// ServeMultiBlockStream serves multiple blocks sequentially over one QUIC stream using FileHandleCache + optional Zstd.
 func (m *Manager) ServeMultiBlockStream(ctx context.Context, peerID string, stream *quic.Stream) {
 	defer stream.Close()
+	stopCancel := context.AfterFunc(ctx, func() {
+		stream.CancelRead(1)
+		stream.CancelWrite(1)
+		_ = stream.Close()
+	})
+	defer stopCancel()
 
+	_ = stream.SetDeadline(time.Now().Add(streamIOTimeout))
 	var req protocol.SyncMultiBlockRequest
 	if err := protocol.ReadFrame(stream, &req); err != nil {
 		return
@@ -1309,39 +1845,60 @@ func (m *Manager) ServeMultiBlockStream(ctx context.Context, peerID string, stre
 	}
 	defer srcFile.Close()
 
-	bufPtr := chunker.GetBuffer()
-	defer chunker.PutBuffer(bufPtr)
-
+	_ = stream.SetDeadline(time.Now().Add(streamIOTimeout))
 	if err := protocol.WriteFrame(stream, protocol.SyncBlockResponse{OK: true}); err != nil {
 		return
 	}
 
+	var hdr [5]byte
 	for _, blk := range req.Blocks {
-		var data []byte
-		if blk.Size > 0 && blk.Size <= chunker.DefaultBlockSize {
-			data = (*bufPtr)[:blk.Size]
-		} else {
-			data = make([]byte, blk.Size)
-		}
-		n, rErr := srcFile.ReadAt(data, blk.Offset)
-		if rErr != nil && rErr != io.EOF {
+		if blk.Size <= 0 || blk.Size > chunker.MaxBlockSize {
 			return
 		}
-		if n != blk.Size {
+		bufPtr := chunker.GetBufferSize(blk.Size)
+		data := (*bufPtr)[:blk.Size]
+		n, rErr := srcFile.ReadAt(data, blk.Offset)
+		if (rErr != nil && rErr != io.EOF) || n != blk.Size {
+			chunker.PutBufferSized(bufPtr)
 			return
 		}
 		if blk.Hash != "" && chunker.HashBytes(data) != blk.Hash {
+			chunker.PutBufferSized(bufPtr)
 			return
 		}
-		if _, err := m.p2p.LimitedWrite(ctx, stream, data); err != nil {
+
+		wireData := data
+		compressed := false
+		if req.AcceptZstd {
+			wireData, compressed = chunker.CompressBlockIfWorthwhile(req.RelPath, data)
+		}
+
+		hdr[0] = 0
+		if compressed {
+			hdr[0] = 1
+		}
+		binary.BigEndian.PutUint32(hdr[1:5], uint32(len(wireData)))
+
+		_ = stream.SetDeadline(time.Now().Add(streamIOTimeout))
+		if _, err := stream.Write(hdr[:]); err != nil {
+			chunker.PutBufferSized(bufPtr)
 			return
 		}
-		m.bytesTx.Add(uint64(len(data)))
+		if _, err := m.p2p.LimitedWrite(ctx, stream, wireData); err != nil {
+			chunker.PutBufferSized(bufPtr)
+			return
+		}
+		chunker.PutBufferSized(bufPtr)
+		m.addFolderTx(req.FolderID, uint64(len(wireData)))
 	}
 }
 
 // OverrideChanges forces remote peers to match local state on a send_only folder.
 func (m *Manager) OverrideChanges(folderID string) error {
+	mu := m.folderPullMutex(folderID)
+	mu.Lock()
+	defer mu.Unlock()
+
 	f, err := m.store.GetFolder(folderID)
 	if err != nil {
 		return err
@@ -1354,27 +1911,39 @@ func (m *Manager) OverrideChanges(folderID string) error {
 	if err != nil {
 		return err
 	}
-	var updates []protocol.FileMetadata
+
+	// Merge clocks across all remote peers per RelPath so 3+ peer meshes don't emit duplicate updates
+	mergedRemoteClocks := make(map[string]protocol.FileMetadata)
 	for _, peerID := range f.Peers {
-		remoteIdx, _ := m.store.GetRemoteIndex(folderID, peerID)
+		remoteIdx, _ := m.store.GetRemoteScanIndex(folderID, peerID)
 		for rel, rem := range remoteIdx {
-			loc, ok := localIdx[rel]
-			if !ok {
-				// File exists remotely but not locally -> push deletion dominating remote clock
-				vc := BumpClock(rem.Version, m.myID)
-				updates = append(updates, protocol.FileMetadata{
-					RelPath: rel,
-					IsDir:   rem.IsDir,
-					Deleted: true,
-					Version: vc,
-				})
+			cur, exists := mergedRemoteClocks[rel]
+			if !exists {
+				mergedRemoteClocks[rel] = rem
 				continue
 			}
-			cmp := CompareClocks(loc.Version, rem.Version)
-			if cmp == RelOlder || cmp == RelConflict {
-				loc.Version = BumpClock(MergeClocks(loc.Version, rem.Version), m.myID)
-				updates = append(updates, loc)
-			}
+			cur.Version = MergeClocks(cur.Version, rem.Version)
+			mergedRemoteClocks[rel] = cur
+		}
+	}
+
+	var updates []protocol.FileMetadata
+	for rel, rem := range mergedRemoteClocks {
+		loc, ok := localIdx[rel]
+		if !ok {
+			vc := BumpClock(rem.Version, m.myID)
+			updates = append(updates, protocol.FileMetadata{
+				RelPath: rel,
+				IsDir:   rem.IsDir,
+				Deleted: true,
+				Version: vc,
+			})
+			continue
+		}
+		cmp := CompareClocks(loc.Version, rem.Version)
+		if cmp == RelOlder || cmp == RelConflict {
+			loc.Version = BumpClock(MergeClocks(loc.Version, rem.Version), m.myID)
+			updates = append(updates, loc)
 		}
 	}
 	if len(updates) > 0 {
@@ -1387,8 +1956,12 @@ func (m *Manager) OverrideChanges(folderID string) error {
 	return nil
 }
 
-// RevertLocalChanges reverts unexpected local modifications on a receive_only folder.
+// RevertLocalChanges reverts unexpected local modifications and extra local files on a receive_only folder.
 func (m *Manager) RevertLocalChanges(ctx context.Context, folderID string) error {
+	mu := m.folderPullMutex(folderID)
+	mu.Lock()
+	defer mu.Unlock()
+
 	f, err := m.store.GetFolder(folderID)
 	if err != nil {
 		return err
@@ -1400,37 +1973,73 @@ func (m *Manager) RevertLocalChanges(ctx context.Context, folderID string) error
 	if err != nil {
 		return err
 	}
-	var reset []protocol.FileMetadata
+
+	remoteUnion := make(map[string]protocol.FileMetadata)
 	for _, peerID := range f.Peers {
-		remoteIdx, _ := m.store.GetRemoteIndex(folderID, peerID)
-		for rel, loc := range localIdx {
-			if rem, ok := remoteIdx[rel]; ok {
-				cmp := CompareClocks(loc.Version, rem.Version)
-				if cmp == RelNewer || cmp == RelConflict {
-					// Reset local clock below remote so reconcileFolder pulls remote cleanly
-					loc.Version = protocol.VectorClock{}
-					reset = append(reset, loc)
-				}
+		remoteIdx, _ := m.store.GetRemoteScanIndex(folderID, peerID)
+		for rel, rem := range remoteIdx {
+			cur, exists := remoteUnion[rel]
+			if !exists || CompareClocks(cur.Version, rem.Version) == RelOlder {
+				remoteUnion[rel] = rem
 			}
 		}
+	}
+
+	var reset []protocol.FileMetadata
+	var extraPaths []string
+	for rel, loc := range localIdx {
+		if rem, ok := remoteUnion[rel]; ok {
+			cmp := CompareClocks(loc.Version, rem.Version)
+			if cmp == RelNewer || cmp == RelConflict {
+				loc.Version = protocol.VectorClock{}
+				reset = append(reset, loc)
+			}
+		} else if !loc.Deleted {
+			extraPaths = append(extraPaths, rel)
+		}
+	}
+
+	// Remove extra local files deepest-first so nested files archive cleanly before parent dirs
+	sort.Slice(extraPaths, func(i, j int) bool {
+		di := strings.Count(extraPaths[i], "/")
+		dj := strings.Count(extraPaths[j], "/")
+		if di != dj {
+			return di > dj
+		}
+		return extraPaths[i] > extraPaths[j]
+	})
+	for _, rel := range extraPaths {
+		if abs, jErr := safeJoin(f.LocalPath, rel); jErr == nil {
+			m.handles.ClosePath(abs)
+			m.markRecentWrite(f.FolderID, abs)
+			_ = ArchiveFile(f.LocalPath, rel, f.Versioning, f.KeepVersions)
+		}
+	}
+	if len(extraPaths) > 0 {
+		_ = m.store.DeleteLocalFiles(folderID, extraPaths)
 	}
 	if len(reset) > 0 {
 		_ = m.store.UpsertLocalFiles(folderID, reset)
 	}
-	go m.reconcileFolder(ctx, *f)
+	m.reconcileFolderLocked(ctx, *f)
 	return nil
 }
 
 func (m *Manager) Statuses() []FolderStatus {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	rx := m.rxBps.Load()
-	tx := m.txBps.Load()
 	out := make([]FolderStatus, 0, len(m.statuses))
 	for _, st := range m.statuses {
 		cp := *st
-		cp.RxBps = rx
-		cp.TxBps = tx
+		if len(st.CaseCollisions) > 0 {
+			cp.CaseCollisions = append([]string(nil), st.CaseCollisions...)
+		}
+		m.folderCntMu.RLock()
+		if fc, ok := m.folderCnts[st.FolderID]; ok {
+			cp.RxBps = fc.rxBps.Load()
+			cp.TxBps = fc.txBps.Load()
+		}
+		m.folderCntMu.RUnlock()
 		out = append(out, cp)
 	}
 	return out
@@ -1495,19 +2104,48 @@ func (m *Manager) ensureWatcher(f store.FolderRecord) {
 		matcher := LoadIgnoreMatcher(f.LocalPath, f.IgnorePatterns)
 		addWatchDirs(watcher, f.LocalPath, f.LocalPath, matcher)
 
+		var dirtyMu sync.Mutex
+		dirtySet := make(map[string]struct{})
+		var forceFull bool
 		var debounceTimer *time.Timer
 		defer func() {
+			dirtyMu.Lock()
 			if debounceTimer != nil {
 				debounceTimer.Stop()
 			}
+			dirtyMu.Unlock()
 		}()
-		triggerDebounced := func() {
+
+		flushDirty := func() {
+			dirtyMu.Lock()
+			full := forceFull
+			forceFull = false
+			paths := make([]string, 0, len(dirtySet))
+			for p := range dirtySet {
+				paths = append(paths, p)
+			}
+			dirtySet = make(map[string]struct{})
+			dirtyMu.Unlock()
+
+			if full || len(paths) == 0 {
+				m.TriggerScan(f.FolderID)
+			} else {
+				m.TriggerPathsScan(f.FolderID, paths)
+			}
+		}
+
+		scheduleDirty := func(rel string, full bool) {
+			dirtyMu.Lock()
+			if full {
+				forceFull = true
+			} else if rel != "" {
+				dirtySet[rel] = struct{}{}
+			}
 			if debounceTimer != nil {
 				debounceTimer.Stop()
 			}
-			debounceTimer = time.AfterFunc(500*time.Millisecond, func() {
-				m.TriggerScan(f.FolderID)
-			})
+			debounceTimer = time.AfterFunc(500*time.Millisecond, flushDirty)
+			dirtyMu.Unlock()
 		}
 
 		for {
@@ -1521,18 +2159,22 @@ func (m *Manager) ensureWatcher(f store.FolderRecord) {
 				base := filepath.Base(ev.Name)
 				if strings.EqualFold(base, ".gensignore") {
 					matcher = LoadIgnoreMatcher(f.LocalPath, f.IgnorePatterns)
-					triggerDebounced()
+					scheduleDirty("", true)
 					continue
 				}
 				if IsInternalPath(f.LocalPath, ev.Name) || m.isRecentWrite(f.FolderID, ev.Name) {
 					continue
 				}
-				if ev.Has(fsnotify.Create) {
+				if ev.Has(fsnotify.Create) || ev.Has(fsnotify.Rename) {
 					if info, err := os.Stat(ev.Name); err == nil && info.IsDir() {
 						addWatchDirs(watcher, f.LocalPath, ev.Name, matcher)
 					}
 				}
-				triggerDebounced()
+				rel := ""
+				if r, rErr := filepath.Rel(f.LocalPath, ev.Name); rErr == nil {
+					rel = filepath.ToSlash(r)
+				}
+				scheduleDirty(rel, rel == "" || rel == ".")
 			case wErr, ok := <-watcher.Errors:
 				if !ok {
 					return
@@ -1569,9 +2211,10 @@ func (m *Manager) broadcastIndexDelta(f store.FolderRecord, files []protocol.Fil
 	if len(files) == 0 {
 		return
 	}
+	_, _, epoch, _ := m.store.GetLocalIndexSummaryWithEpoch(f.FolderID)
 	for _, peerID := range f.Peers {
 		if m.p2p.IsConnected(peerID) {
-			m.sendFolderIndexBatched(peerID, f.FolderID, false, files)
+			m.sendFolderIndexBatched(peerID, f.FolderID, false, epoch, files)
 		}
 	}
 }
@@ -1806,7 +2449,6 @@ func stripConflictSuffix(rel string) string {
 		return rel
 	}
 	rest := rel[idx+len(".sync-conflict-"):]
-	// format: YYYYMMDD-HHMMSS-DEVICE.ext
 	dotIdx := strings.Index(rest, ".")
 	if dotIdx < 0 {
 		return rel[:idx]

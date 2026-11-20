@@ -3,8 +3,8 @@ package relay
 import (
 	"context"
 	"crypto/rand"
-	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -48,8 +48,16 @@ type pendingEntry struct {
 }
 
 type wsOutFrame struct {
-	typ  websocket.MessageType
-	data []byte
+	typ     websocket.MessageType
+	data    []byte
+	poolPtr *[]byte
+}
+
+var relayFramePool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 4096+300)
+		return &b
+	},
 }
 
 type clientConn struct {
@@ -59,10 +67,14 @@ type clientConn struct {
 	quicPort      int
 	observedIP    string
 	observedAddr  string
+	stunToken     string
+	udpToken      [16]byte
+	udpRelayAddr  *net.UDPAddr
 	connectedAt   int64
 	watchIDs      map[string]struct{}
 	ws            *websocket.Conn
-	sendCh        chan wsOutFrame
+	ctrlCh        chan wsOutFrame // priority signaling channel
+	relayCh       chan wsOutFrame // droppable best-effort binary relay channel
 	closed        atomic.Bool
 	rxBytes       atomic.Uint64
 	txBytes       atomic.Uint64
@@ -72,7 +84,7 @@ type clientConn struct {
 	mu            sync.RWMutex
 }
 
-func newClientConn(deviceID, name string, lanAddrs []string, quicPort int, observedIP, observedAddr string, ws *websocket.Conn) *clientConn {
+func newClientConn(deviceID, name string, lanAddrs []string, quicPort int, observedIP, observedAddr, stunToken string, udpToken [16]byte, ws *websocket.Conn) *clientConn {
 	return &clientConn{
 		deviceID:      deviceID,
 		name:          name,
@@ -80,29 +92,55 @@ func newClientConn(deviceID, name string, lanAddrs []string, quicPort int, obser
 		quicPort:      quicPort,
 		observedIP:    observedIP,
 		observedAddr:  observedAddr,
+		stunToken:     stunToken,
+		udpToken:      udpToken,
 		connectedAt:   time.Now().Unix(),
 		watchIDs:      make(map[string]struct{}),
 		ws:            ws,
-		sendCh:        make(chan wsOutFrame, 256),
+		ctrlCh:        make(chan wsOutFrame, 128),
+		relayCh:       make(chan wsOutFrame, 256),
 		redeemLimiter: rate.NewLimiter(rate.Every(12*time.Second), 5),
 	}
+}
+
+func (c *clientConn) writeFrame(ctx context.Context, frame wsOutFrame) bool {
+	wCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	err := c.ws.Write(wCtx, frame.typ, frame.data)
+	cancel()
+	if frame.poolPtr != nil && cap(*frame.poolPtr) <= 8192 {
+		relayFramePool.Put(frame.poolPtr)
+	}
+	if err != nil {
+		_ = c.ws.CloseNow()
+		return false
+	}
+	return true
 }
 
 func (c *clientConn) startWriter(ctx context.Context) {
 	go func() {
 		for {
+			// Always prioritize signaling control frames over best-effort relay data
 			select {
 			case <-ctx.Done():
 				return
-			case frame, ok := <-c.sendCh:
-				if !ok {
+			case frame := <-c.ctrlCh:
+				if !c.writeFrame(ctx, frame) {
 					return
 				}
-				wCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-				err := c.ws.Write(wCtx, frame.typ, frame.data)
-				cancel()
-				if err != nil {
-					_ = c.ws.CloseNow()
+				continue
+			default:
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case frame := <-c.ctrlCh:
+				if !c.writeFrame(ctx, frame) {
+					return
+				}
+			case frame := <-c.relayCh:
+				if !c.writeFrame(ctx, frame) {
 					return
 				}
 			}
@@ -110,43 +148,60 @@ func (c *clientConn) startWriter(ctx context.Context) {
 	}()
 }
 
-func (c *clientConn) enqueue(typ websocket.MessageType, data []byte) error {
+func (c *clientConn) send(_ context.Context, msg protocol.SignalingMessage) error {
 	if c.closed.Load() {
 		return net.ErrClosed
 	}
-	select {
-	case c.sendCh <- wsOutFrame{typ: typ, data: data}:
-		return nil
-	default:
-		// Backpressure: drop packet on saturated slow peer without blocking sender
-		return fmt.Errorf("client send queue saturated")
-	}
-}
-
-func (c *clientConn) send(_ context.Context, msg protocol.SignalingMessage) error {
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return err
 	}
-	return c.enqueue(websocket.MessageText, data)
+	select {
+	case c.ctrlCh <- wsOutFrame{typ: websocket.MessageText, data: data}:
+		return nil
+	default:
+		return fmt.Errorf("client control queue saturated")
+	}
 }
 
-func (c *clientConn) sendBinary(_ context.Context, data []byte) error {
-	return c.enqueue(websocket.MessageBinary, data)
+func (c *clientConn) sendBinary(_ context.Context, data []byte, poolPtr *[]byte) error {
+	if c.closed.Load() {
+		if poolPtr != nil && cap(*poolPtr) <= 8192 {
+			relayFramePool.Put(poolPtr)
+		}
+		return net.ErrClosed
+	}
+	select {
+	case c.relayCh <- wsOutFrame{typ: websocket.MessageBinary, data: data, poolPtr: poolPtr}:
+		return nil
+	default:
+		if poolPtr != nil && cap(*poolPtr) <= 8192 {
+			relayFramePool.Put(poolPtr)
+		}
+		return fmt.Errorf("client relay queue saturated")
+	}
 }
 
-// Server implements the zero-file-transit signaling & discovery server.
+type authFailEntry struct {
+	count   int
+	resetAt time.Time
+}
+
+// Server implements the zero-file-transit signaling, STUN, and UDP/WS Blind Relay server.
 type Server struct {
-	opts      Options
-	cfg       *RelayConfig
-	logs      *logs.RingBuffer
-	startedAt time.Time
-	stunPort  int32
+	opts       Options
+	cfg        *RelayConfig
+	logs       *logs.RingBuffer
+	startedAt  time.Time
+	stunPort   int32
+	setupToken string
 
 	mu               sync.RWMutex
 	clients          map[string]*clientConn
+	udpTokens        map[[16]byte]*clientConn
 	pairCodes        map[string]pairEntry
 	pendingSignaling map[string][]pendingEntry
+	udpConn          *net.UDPConn
 
 	limiterMu    sync.RWMutex
 	relayLimiter *rate.Limiter
@@ -155,14 +210,19 @@ type Server struct {
 
 	ipLimMu     sync.Mutex
 	ipLimiters  map[string]*ipRateEntry
+	authFailMu  sync.Mutex
+	authFails   map[string]*authFailEntry
 
 	adminWsMu      sync.Mutex
 	adminWsClients map[*adminWsSub]struct{}
 	adminEventCh   chan []byte
+	stopOnce       sync.Once
 
-	relayPacketsTotal atomic.Uint64
-	relayBytesTotal   atomic.Uint64
-	relayBps          atomic.Int64
+	relayPacketsTotal  atomic.Uint64
+	relayBytesTotal    atomic.Uint64
+	udpRelayBytesTotal atomic.Uint64
+	wsRelayBytesTotal  atomic.Uint64
+	relayBps           atomic.Int64
 }
 
 type ipRateEntry struct {
@@ -175,21 +235,35 @@ func NewServer(opts Options) *Server {
 	if cfg == nil {
 		cfg, _ = LoadOrCreateConfig("", opts)
 	}
+	var setupTokBytes [6]byte
+	_, _ = rand.Read(setupTokBytes[:])
+	setupTok := strings.ToUpper(hex.EncodeToString(setupTokBytes[:]))
+
 	s := &Server{
 		opts:             opts,
 		cfg:              cfg,
 		logs:             opts.Logs,
 		startedAt:        time.Now(),
+		setupToken:       setupTok,
 		clients:          make(map[string]*clientConn),
+		udpTokens:        make(map[[16]byte]*clientConn),
 		pairCodes:        make(map[string]pairEntry),
 		pendingSignaling: make(map[string][]pendingEntry),
 		ipLimiters:       make(map[string]*ipRateEntry),
+		authFails:        make(map[string]*authFailEntry),
 		adminWsClients:   make(map[*adminWsSub]struct{}),
 		adminEventCh:     make(chan []byte, 256),
+	}
+	if cfg.Snapshot().AdminPassHash == "" && opts.Config != nil {
+		log.Printf("[relay-server] First-run setup active. Remote setup token: %s", s.setupToken)
 	}
 	s.refreshLimiter()
 	go s.adminBroadcastLoop()
 	return s
+}
+
+func (s *Server) SetupToken() string {
+	return s.setupToken
 }
 
 func (s *Server) allowIPConnect(ip string) bool {
@@ -209,6 +283,39 @@ func (s *Server) allowIPConnect(ip string) bool {
 	lim := ent.limiter
 	s.ipLimMu.Unlock()
 	return lim.Allow()
+}
+
+func (s *Server) allowAdminAuth(ip string) bool {
+	if ip == "" {
+		return true
+	}
+	now := time.Now()
+	s.authFailMu.Lock()
+	defer s.authFailMu.Unlock()
+	ent, ok := s.authFails[ip]
+	if !ok || now.After(ent.resetAt) {
+		return true
+	}
+	return ent.count < 5
+}
+
+func (s *Server) recordAdminAuthResult(ip string, ok bool) {
+	if ip == "" {
+		return
+	}
+	now := time.Now()
+	s.authFailMu.Lock()
+	defer s.authFailMu.Unlock()
+	if ok {
+		delete(s.authFails, ip)
+		return
+	}
+	ent, exists := s.authFails[ip]
+	if !exists || now.After(ent.resetAt) {
+		s.authFails[ip] = &authFailEntry{count: 1, resetAt: now.Add(1 * time.Minute)}
+		return
+	}
+	ent.count++
 }
 
 func (s *Server) refreshLimiter() {
@@ -233,10 +340,22 @@ func (s *Server) allowRelayBytes(client *clientConn, n int) bool {
 	ver := s.relayLimVer.Load()
 	s.limiterMu.RLock()
 	kbps := s.relayLimKBps
+	globalLim := s.relayLimiter
 	s.limiterMu.RUnlock()
 
 	if kbps <= 0 {
 		return true
+	}
+
+	now := time.Now()
+	if globalLim != nil {
+		gn := n
+		if gn > globalLim.Burst() {
+			gn = globalLim.Burst()
+		}
+		if !globalLim.AllowN(now, gn) {
+			return false
+		}
 	}
 
 	client.mu.Lock()
@@ -252,10 +371,11 @@ func (s *Server) allowRelayBytes(client *clientConn, n int) bool {
 	lim := client.relayLimiter
 	client.mu.Unlock()
 
-	if n > lim.Burst() {
-		n = lim.Burst()
+	cn := n
+	if cn > lim.Burst() {
+		cn = lim.Burst()
 	}
-	return lim.AllowN(time.Now(), n)
+	return lim.AllowN(now, cn)
 }
 
 // StartBackground launches periodic cleanup and live throughput sampling for the admin UI.
@@ -275,12 +395,45 @@ func (s *Server) StartBackground(ctx context.Context) {
 				cur := s.relayBytesTotal.Load()
 				s.relayBps.Store(int64(cur - prevBytes))
 				prevBytes = cur
-				s.broadcastAdminEvent("status_updated", s.StatusSnapshot())
+				if s.hasAdminClients() {
+					s.broadcastAdminEvent("status_updated", s.StatusSnapshot())
+				}
 			case <-pruneTicker.C:
 				s.pruneExpired()
 			}
 		}
 	}()
+}
+
+// Shutdown cleanly terminates all client sessions, admin subscribers, and the UDP socket.
+func (s *Server) Shutdown(_ context.Context) {
+	s.stopOnce.Do(func() {
+		s.mu.Lock()
+		clients := make([]*clientConn, 0, len(s.clients))
+		for _, c := range s.clients {
+			clients = append(clients, c)
+		}
+		udpConn := s.udpConn
+		s.udpConn = nil
+		s.mu.Unlock()
+
+		for _, c := range clients {
+			c.closed.Store(true)
+			_ = c.ws.Close(websocket.StatusGoingAway, "relay server shutting down")
+		}
+		if udpConn != nil {
+			_ = udpConn.Close()
+		}
+
+		s.adminWsMu.Lock()
+		for sub := range s.adminWsClients {
+			delete(s.adminWsClients, sub)
+			close(sub.send)
+			_ = sub.conn.CloseNow()
+		}
+		s.adminWsMu.Unlock()
+		close(s.adminEventCh)
+	})
 }
 
 func (s *Server) pruneExpired() {
@@ -315,9 +468,17 @@ func (s *Server) pruneExpired() {
 		}
 	}
 	s.ipLimMu.Unlock()
+
+	s.authFailMu.Lock()
+	for ip, ent := range s.authFails {
+		if now.After(ent.resetAt) {
+			delete(s.authFails, ip)
+		}
+	}
+	s.authFailMu.Unlock()
 }
 
-// StartUDP launches a lightweight UDP STUN/echo listener so peers behind NAT can discover their mapped public UDP port.
+// StartUDP launches the multiplexed UDP STUN + native UDP Blind Relay listener.
 func (s *Server) StartUDP(ctx context.Context, addr string) error {
 	udpAddr, err := net.ResolveUDPAddr("udp4", addr)
 	if err != nil {
@@ -327,30 +488,52 @@ func (s *Server) StartUDP(ctx context.Context, addr string) error {
 	if err != nil {
 		return err
 	}
+	_ = conn.SetReadBuffer(8 * 1024 * 1024)
+	_ = conn.SetWriteBuffer(8 * 1024 * 1024)
 	port := conn.LocalAddr().(*net.UDPAddr).Port
 	atomic.StoreInt32(&s.stunPort, int32(port))
+
+	s.mu.Lock()
+	s.udpConn = conn
+	s.mu.Unlock()
 
 	go func() {
 		<-ctx.Done()
 		_ = conn.Close()
 	}()
 	go func() {
-		buf := make([]byte, 512)
+		buf := make([]byte, 4096)
 		for {
 			n, remote, err := conn.ReadFromUDP(buf)
 			if err != nil {
 				return
 			}
-			line := strings.TrimSpace(string(buf[:n]))
+			pkt := buf[:n]
+
+			// 1. Native UDP Blind Relay frame
+			if tok, targetID, payload, ok := protocol.DecodeUDPRelayPacket(pkt); ok {
+				s.handleUDPRelayPacket(ctx, conn, remote, tok, targetID, payload)
+				continue
+			}
+
+			// 2. Authenticated UDP STUN echo
+			line := strings.TrimSpace(string(pkt))
 			if strings.HasPrefix(line, "GENSSTUN:") {
-				devID := protocol.NormalizeDeviceID(strings.TrimPrefix(line, "GENSSTUN:"))
+				rest := strings.TrimPrefix(line, "GENSSTUN:")
+				parts := strings.SplitN(rest, ":", 2)
+				devID := protocol.NormalizeDeviceID(parts[0])
+				stunTok := ""
+				if len(parts) > 1 {
+					stunTok = parts[1]
+				}
 				remoteStr := remote.String()
 				remoteIP := remote.IP.String()
 				updated := false
+
 				s.mu.RLock()
-				c, ok := s.clients[devID]
+				c, exists := s.clients[devID]
 				s.mu.RUnlock()
-				if ok {
+				if exists && c.stunToken != "" && stunTok == c.stunToken {
 					c.mu.Lock()
 					if c.observedIP == remoteIP || remote.IP.IsLoopback() {
 						if c.observedAddr != remoteStr {
@@ -362,12 +545,98 @@ func (s *Server) StartUDP(ctx context.Context, addr string) error {
 					if updated {
 						s.notifyWatchers(devID)
 					}
+					_, _ = conn.WriteToUDP([]byte("GENSSTUN_OK:"+remoteStr), remote)
 				}
-				_, _ = conn.WriteToUDP([]byte("GENSSTUN_OK:"+remoteStr), remote)
 			}
 		}
 	}()
 	return nil
+}
+
+func (s *Server) handleUDPRelayPacket(ctx context.Context, conn *net.UDPConn, remote *net.UDPAddr, tok [16]byte, targetID string, payload []byte) {
+	s.mu.RLock()
+	sender, ok := s.udpTokens[tok]
+	s.mu.RUnlock()
+	if !ok {
+		return
+	}
+
+	sender.mu.Lock()
+	sender.udpRelayAddr = &net.UDPAddr{IP: append([]byte(nil), remote.IP...), Port: remote.Port, Zone: remote.Zone}
+	sender.mu.Unlock()
+
+	if targetID == "" {
+		// Keepalive / probe echo confirming bidirectional UDP reachability
+		pong := protocol.EncodeUDPRelayPacket(nil, tok, "", nil)
+		_, _ = conn.WriteToUDP(pong, remote)
+		return
+	}
+
+	if !s.cfg.Snapshot().EnableBlindRelay || len(payload) == 0 {
+		return
+	}
+	if !s.allowRelayBytes(sender, len(payload)) {
+		return
+	}
+
+	s.mu.RLock()
+	target, online := s.clients[targetID]
+	s.mu.RUnlock()
+	if !online {
+		return
+	}
+
+	target.mu.RLock()
+	tAddr := target.udpRelayAddr
+	tTok := target.udpToken
+	target.mu.RUnlock()
+
+	if tAddr != nil {
+		bufPtr := relayFramePool.Get().(*[]byte)
+		out := protocol.EncodeUDPRelayPacket(*bufPtr, tTok, sender.deviceID, payload)
+		_, err := conn.WriteToUDP(out, tAddr)
+		if cap(out) <= 8192 {
+			*bufPtr = out[:cap(out)]
+			relayFramePool.Put(bufPtr)
+		}
+		if err == nil {
+			s.relayPacketsTotal.Add(1)
+			s.relayBytesTotal.Add(uint64(len(payload)))
+			s.udpRelayBytesTotal.Add(uint64(len(payload)))
+			sender.txBytes.Add(uint64(len(payload)))
+			target.rxBytes.Add(uint64(len(payload)))
+		}
+		return
+	}
+
+	// Fallback seamlessly to WebSocket binary frame if target lacks an active UDP relay mapping
+	senderBytes := []byte(sender.deviceID)
+	if len(senderBytes) > 255 {
+		return
+	}
+	need := 2 + len(senderBytes) + len(payload)
+	bufPtr := relayFramePool.Get().(*[]byte)
+	var wsOut []byte
+	var usedPool *[]byte
+	if cap(*bufPtr) >= need {
+		wsOut = (*bufPtr)[:need]
+		usedPool = bufPtr
+	} else {
+		relayFramePool.Put(bufPtr)
+		wsOut = make([]byte, need)
+	}
+	wsOut[0] = 0x01
+	wsOut[1] = byte(len(senderBytes))
+	copy(wsOut[2:], senderBytes)
+	copy(wsOut[2+len(senderBytes):], payload)
+
+	if err := target.sendBinary(ctx, wsOut, usedPool); err == nil {
+		s.relayPacketsTotal.Add(1)
+		s.relayBytesTotal.Add(uint64(len(payload)))
+		s.wsRelayBytesTotal.Add(uint64(len(payload)))
+		sender.txBytes.Add(uint64(len(payload)))
+		target.rxBytes.Add(uint64(len(payload)))
+	}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -401,6 +670,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 		"online_devices":      onlineCount,
 		"blind_relay_enabled": snap.EnableBlindRelay,
 		"stun_port":           atomic.LoadInt32(&s.stunPort),
+		"udp_relay_port":      atomic.LoadInt32(&s.stunPort),
 		"stores_files":        false,
 	})
 }
@@ -414,13 +684,14 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	_, _ = fmt.Fprintf(w,
-		"gens_relay_online_devices %d\ngens_relay_active_pair_codes %d\ngens_relay_pending_queues %d\ngens_relay_blind_packets_total %d\ngens_relay_blind_bytes_total %d\n",
-		onlineCount, pairCodeCount, pendingCount, s.relayPacketsTotal.Load(), s.relayBytesTotal.Load(),
+		"gens_relay_online_devices %d\ngens_relay_active_pair_codes %d\ngens_relay_pending_queues %d\ngens_relay_blind_packets_total %d\ngens_relay_blind_bytes_total %d\ngens_relay_udp_bytes_total %d\ngens_relay_ws_bytes_total %d\n",
+		onlineCount, pairCodeCount, pendingCount, s.relayPacketsTotal.Load(), s.relayBytesTotal.Load(), s.udpRelayBytesTotal.Load(), s.wsRelayBytesTotal.Load(),
 	)
 }
 
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
-	if !s.allowIPConnect(s.extractRemoteIP(r)) {
+	remoteIP := s.extractRemoteIP(r)
+	if !s.allowIPConnect(remoteIP) {
 		http.Error(w, "too many connections", http.StatusTooManyRequests)
 		return
 	}
@@ -435,7 +706,6 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
-	// 1. Send random authentication challenge
 	var nonce [32]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return
@@ -448,7 +718,6 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. Expect register message within 10s auth timeout
 	authCtx, authCancel := context.WithTimeout(ctx, 10*time.Second)
 	regMsg, err := readWSJSON(authCtx, ws)
 	authCancel()
@@ -459,8 +728,8 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	snap := s.cfg.Snapshot()
 	if snap.AuthToken != "" {
-		if subtle.ConstantTimeCompare([]byte(regMsg.AuthToken), []byte(snap.AuthToken)) != 1 {
-			_ = writeWSJSON(ctx, ws, protocol.SignalingMessage{Type: protocol.SigError, Error: "invalid auth_token"})
+		if !protocol.VerifyAuthProof(snap.AuthToken, nonce[:], regMsg.AuthProofB64) {
+			_ = writeWSJSON(ctx, ws, protocol.SignalingMessage{Type: protocol.SigError, Error: "invalid auth proof"})
 			return
 		}
 	}
@@ -486,7 +755,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	observedIP := s.extractRemoteIP(r)
+	observedIP := remoteIP
 	observedAddr := ""
 	if observedIP != "" && regMsg.QUICPort > 0 {
 		observedAddr = net.JoinHostPort(observedIP, fmt.Sprintf("%d", regMsg.QUICPort))
@@ -494,7 +763,13 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		observedAddr = observedIP
 	}
 
-	client := newClientConn(deviceID, regMsg.Name, regMsg.LANAddrs, regMsg.QUICPort, observedIP, observedAddr, ws)
+	var stunTokBytes [8]byte
+	var udpTok [16]byte
+	_, _ = rand.Read(stunTokBytes[:])
+	_, _ = rand.Read(udpTok[:])
+	stunToken := hex.EncodeToString(stunTokBytes[:])
+
+	client := newClientConn(deviceID, regMsg.Name, regMsg.LANAddrs, regMsg.QUICPort, observedIP, observedAddr, stunToken, udpTok, ws)
 
 	maxClients := snap.MaxClients
 	if maxClients <= 0 {
@@ -510,12 +785,17 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 	if existed {
 		old.closed.Store(true)
+		delete(s.udpTokens, old.udpToken)
 		_ = old.ws.Close(websocket.StatusPolicyViolation, "replaced by new session")
 	}
 	s.clients[deviceID] = client
+	s.udpTokens[udpTok] = client
 	s.mu.Unlock()
 
-	client.startWriter(ctx)
+	connCtx, connCancel := context.WithCancel(ctx)
+	defer connCancel()
+
+	client.startWriter(connCtx)
 	log.Printf("[relay-server] Device connected: %s (%s) observed=%s", deviceID, client.name, observedAddr)
 	s.broadcastAdminClients()
 
@@ -525,35 +805,40 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		if cur, ok := s.clients[deviceID]; ok && cur == client {
 			delete(s.clients, deviceID)
 		}
+		delete(s.udpTokens, udpTok)
 		s.mu.Unlock()
 		s.notifyWatchers(deviceID)
 		s.broadcastAdminClients()
 		log.Printf("[relay-server] Device disconnected: %s", deviceID)
 	}()
 
-	_ = client.send(ctx, protocol.SignalingMessage{
-		Type:         protocol.SigRegistered,
-		DeviceID:     deviceID,
-		ObservedAddr: observedAddr,
-		STUNPort:     int(atomic.LoadInt32(&s.stunPort)),
+	udpPort := int(atomic.LoadInt32(&s.stunPort))
+	_ = client.send(connCtx, protocol.SignalingMessage{
+		Type:          protocol.SigRegistered,
+		DeviceID:      deviceID,
+		ObservedAddr:  observedAddr,
+		STUNPort:      udpPort,
+		STUNToken:     stunToken,
+		UDPRelayPort:  udpPort,
+		UDPRelayToken: hex.EncodeToString(udpTok[:]),
 	})
-	s.flushPendingSignaling(ctx, client)
+	s.flushPendingSignaling(connCtx, client)
 	s.notifyWatchers(deviceID)
 
 	for {
-		msgType, data, err := ws.Read(ctx)
+		msgType, data, err := ws.Read(connCtx)
 		if err != nil {
 			return
 		}
 		if msgType == websocket.MessageBinary {
-			s.handleBinaryRelay(ctx, client, data)
+			s.handleBinaryRelay(connCtx, client, data)
 			continue
 		}
 		var msg protocol.SignalingMessage
 		if err := json.Unmarshal(data, &msg); err != nil {
 			continue
 		}
-		s.handleClientMessage(ctx, client, msg)
+		s.handleClientMessage(connCtx, client, msg)
 	}
 }
 
@@ -578,19 +863,56 @@ func (s *Server) handleBinaryRelay(ctx context.Context, client *clientConn, data
 		return
 	}
 
+	// If target has an active UDP relay mapping, forward directly over UDP!
+	target.mu.RLock()
+	tAddr := target.udpRelayAddr
+	tTok := target.udpToken
+	target.mu.RUnlock()
+	s.mu.RLock()
+	udpConn := s.udpConn
+	s.mu.RUnlock()
+	if tAddr != nil && udpConn != nil {
+		bufPtr := relayFramePool.Get().(*[]byte)
+		out := protocol.EncodeUDPRelayPacket(*bufPtr, tTok, client.deviceID, payload)
+		_, err := udpConn.WriteToUDP(out, tAddr)
+		if cap(out) <= 8192 {
+			*bufPtr = out[:cap(out)]
+			relayFramePool.Put(bufPtr)
+		}
+		if err == nil {
+			s.relayPacketsTotal.Add(1)
+			s.relayBytesTotal.Add(uint64(len(payload)))
+			s.udpRelayBytesTotal.Add(uint64(len(payload)))
+			client.txBytes.Add(uint64(len(payload)))
+			target.rxBytes.Add(uint64(len(payload)))
+		}
+		return
+	}
+
 	senderBytes := []byte(client.deviceID)
 	if len(senderBytes) > 255 {
 		return
 	}
-	out := make([]byte, 2+len(senderBytes)+len(payload))
+	need := 2 + len(senderBytes) + len(payload)
+	bufPtr := relayFramePool.Get().(*[]byte)
+	var out []byte
+	var usedPool *[]byte
+	if cap(*bufPtr) >= need {
+		out = (*bufPtr)[:need]
+		usedPool = bufPtr
+	} else {
+		relayFramePool.Put(bufPtr)
+		out = make([]byte, need)
+	}
 	out[0] = 0x01
 	out[1] = byte(len(senderBytes))
 	copy(out[2:], senderBytes)
 	copy(out[2+len(senderBytes):], payload)
 
-	if err := target.sendBinary(ctx, out); err == nil {
+	if err := target.sendBinary(ctx, out, usedPool); err == nil {
 		s.relayPacketsTotal.Add(1)
 		s.relayBytesTotal.Add(uint64(len(payload)))
+		s.wsRelayBytesTotal.Add(uint64(len(payload)))
 		client.txBytes.Add(uint64(len(payload)))
 		target.rxBytes.Add(uint64(len(payload)))
 	}
@@ -638,7 +960,6 @@ func (s *Server) handleClientMessage(ctx context.Context, client *clientConn, ms
 			return
 		}
 
-		// Refresh live hint if creator is still online
 		hint := entry.hint
 		s.mu.RLock()
 		if live, online := s.clients[hint.DeviceID]; online {
@@ -651,7 +972,6 @@ func (s *Server) handleClientMessage(ctx context.Context, client *clientConn, ms
 			Peer: &hint,
 		})
 
-		// Also notify the pair code creator so both sides add/approve each other
 		creatorHint := client.toHint()
 		s.deliverOrQueue(ctx, hint.DeviceID, protocol.SignalingMessage{
 			Type:     protocol.SigPairIncoming,
@@ -765,6 +1085,7 @@ func (s *Server) handleClientMessage(ctx context.Context, client *clientConn, ms
 			}); err == nil {
 				s.relayPacketsTotal.Add(1)
 				s.relayBytesTotal.Add(uint64(len(rawPkt)))
+				s.wsRelayBytesTotal.Add(uint64(len(rawPkt)))
 				client.txBytes.Add(uint64(len(rawPkt)))
 				target.rxBytes.Add(uint64(len(rawPkt)))
 			}
@@ -782,7 +1103,6 @@ func (s *Server) deliverOrQueue(ctx context.Context, targetID string, msg protoc
 			s.mu.Unlock()
 			return
 		}
-		// Prune expired entries (>24h) opportunistically
 		q := s.pendingSignaling[targetID]
 		fresh := q[:0]
 		cutoff := now.Add(-24 * time.Hour)
@@ -916,9 +1236,8 @@ func (s *Server) extractRemoteIP(r *http.Request) string {
 	if err != nil {
 		host = r.RemoteAddr
 	}
-	remoteIP := net.ParseIP(host)
-	isTrusted := s.cfg.Snapshot().TrustProxy || (remoteIP != nil && (remoteIP.IsLoopback() || remoteIP.IsPrivate()))
-	if isTrusted {
+	// Strict TrustProxy: only accept forwarded headers when explicitly enabled
+	if s.cfg.Snapshot().TrustProxy {
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 			parts := strings.Split(xff, ",")
 			if len(parts) > 0 {
