@@ -14,7 +14,7 @@ use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use std::os::windows::process::CommandExt;
 
 const DEFAULT_ADMIN_ADDR: &str = "127.0.0.1:38421";
-const SINGLE_INSTANCE_ADDR: &str = "127.0.0.1:48386";
+const SINGLE_INSTANCE_ADDR: &str = "127.0.0.1:48387";
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -42,84 +42,6 @@ fn relay_data_dir() -> Option<PathBuf> {
     None
 }
 
-fn find_json_value_start<'a>(raw: &'a str, key: &str) -> Option<&'a str> {
-    let bytes = raw.as_bytes();
-    let mut i = 0;
-    let mut depth = 0usize;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'{' => {
-                depth += 1;
-                i += 1;
-            }
-            b'}' => {
-                depth = depth.saturating_sub(1);
-                i += 1;
-            }
-            b'"' => {
-                i += 1;
-                let start = i;
-                let mut escaped = false;
-                while i < bytes.len() {
-                    if escaped {
-                        escaped = false;
-                        i += 1;
-                        continue;
-                    }
-                    if bytes[i] == b'\\' {
-                        escaped = true;
-                        i += 1;
-                        continue;
-                    }
-                    if bytes[i] == b'"' {
-                        break;
-                    }
-                    i += 1;
-                }
-                let tok = &raw[start..i.min(bytes.len())];
-                if i < bytes.len() {
-                    i += 1;
-                }
-                if depth == 1 && tok == key {
-                    let rest = raw[i..].trim_start();
-                    if let Some(after_colon) = rest.strip_prefix(':') {
-                        return Some(after_colon.trim_start());
-                    }
-                }
-            }
-            _ => i += 1,
-        }
-    }
-    None
-}
-
-fn extract_json_string(raw: &str, key: &str) -> Option<String> {
-    let rest = find_json_value_start(raw, key)?;
-    let mut chars = rest.chars();
-    if chars.next()? != '"' {
-        return None;
-    }
-    let mut out = String::new();
-    let mut escaped = false;
-    for ch in chars {
-        if escaped {
-            match ch {
-                'n' => out.push('\n'),
-                'r' => out.push('\r'),
-                't' => out.push('\t'),
-                other => out.push(other),
-            }
-            escaped = false;
-        } else if ch == '\\' {
-            escaped = true;
-        } else if ch == '"' {
-            return Some(out);
-        } else {
-            out.push(ch);
-        }
-    }
-    None
-}
 
 fn normalize_loopback_addr(addr: &str) -> String {
     if let Some(rest) = addr.strip_prefix("0.0.0.0:") {
@@ -139,14 +61,16 @@ fn read_relay_admin_target() -> (String, String, String) {
 
     if let Some(dir) = relay_data_dir() {
         if let Ok(raw) = std::fs::read_to_string(dir.join("relay-config.json")) {
-            if let Some(val) = extract_json_string(&raw, "admin_listen") {
-                let trimmed = val.trim();
-                if !trimmed.is_empty() && trimmed != "off" {
-                    admin_addr = normalize_loopback_addr(trimmed);
-                } else if trimmed == "off" || trimmed.is_empty() {
-                    if let Some(la) = extract_json_string(&raw, "listen_addr") {
-                        admin_addr = normalize_loopback_addr(la.trim());
-                        path_prefix = "/admin".to_string();
+            if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if let Some(val) = cfg.get("admin_listen").and_then(|v| v.as_str()) {
+                    let trimmed = val.trim();
+                    if !trimmed.is_empty() && trimmed != "off" {
+                        admin_addr = normalize_loopback_addr(trimmed);
+                    } else if trimmed == "off" || trimmed.is_empty() {
+                        if let Some(la) = cfg.get("listen_addr").and_then(|v| v.as_str()) {
+                            admin_addr = normalize_loopback_addr(la.trim());
+                            path_prefix = "/admin".to_string();
+                        }
                     }
                 }
             }
@@ -483,7 +407,10 @@ pub fn run() {
                 }
             });
 
-            // Watchdog: restart relay-server sidecar ONLY on unexpected crash (code != 0) with exponential backoff.
+            // Watchdog: relance relay-server en cas de crash (code != 0) OU d'un
+            // exit propre NON demandé par l'utilisateur (bug, SIGTERM indésiré),
+            // avec un backoff exponentiel. Un arrêt propre demandé via l'UI
+            // (flag exiting posé par stop_relay) ne doit JAMAIS déclencher de respawn.
             let watchdog_child = child_arc.clone();
             let watchdog_exit = exiting_arc.clone();
             std::thread::spawn(move || {
@@ -500,10 +427,11 @@ pub fn run() {
                             match child.try_wait() {
                                 Ok(Some(status)) => {
                                     *guard = None;
-                                    if status.success() {
-                                        watchdog_exit.store(true, Ordering::SeqCst);
+                                    if status.success() && watchdog_exit.load(Ordering::SeqCst) {
+                                        // Arrêt propre demandé par l'utilisateur → ne plus respawn.
                                         consecutive_failures = 0;
                                     } else {
+                                        // Crash, ou exit propre sans demande utilisateur → respawn.
                                         crashed = true;
                                     }
                                 }

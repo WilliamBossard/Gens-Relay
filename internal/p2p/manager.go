@@ -8,7 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"net/url"
 	"strconv"
@@ -106,6 +106,10 @@ type Manager struct {
 	pairCodeCh     chan protocol.SignalingMessage
 	pairResolvedCh chan protocol.SignalingMessage
 	relayRestartCh chan struct{}
+	// relayRestartRequested marque un restart demandé alors que le canal était
+	// déjà plein (ou que la boucle relay client était occupée) : le signal n'est
+	// pas perdu et sera traité au prochain cycle de la boucle.
+	relayRestartRequested atomic.Bool
 
 	upLimiter   *rate.Limiter
 	downLimiter *rate.Limiter
@@ -276,7 +280,7 @@ func (m *Manager) Start(ctx context.Context) error {
 		udpConn, err = net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: port})
 	}
 	if err != nil && port != 0 {
-		log.Printf("[p2p] Configured QUIC UDP port :%d unavailable (%v); falling back to ephemeral port", port, err)
+		slog.Warn("configured QUIC port unavailable, falling back to ephemeral", "port", port, "err", err)
 		udpConn, err = net.ListenUDP("udp", &net.UDPAddr{Port: 0})
 		if err != nil {
 			udpConn, err = net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
@@ -314,7 +318,7 @@ func (m *Manager) Start(ctx context.Context) error {
 	}
 	m.relayListen = rLn
 
-	log.Printf("[p2p] QUIC listening on UDP :%d (ALPN: %s, DeviceID: %s)", m.quicPort, protocol.ALPNProtocol, m.id.DeviceID)
+	slog.Info("QUIC listening", "port", m.quicPort, "alpn", protocol.ALPNProtocol, "device", m.id.DeviceID)
 
 	if m.cfg.Snapshot().EnableUPnP && m.cfg.Snapshot().QUICPort > 0 {
 		m.stopNAT = StartNATMapping(ctx, m.quicPort)
@@ -483,7 +487,7 @@ func (m *Manager) registerSession(ctx context.Context, peerID string, conn *quic
 	}
 
 	_ = m.store.TouchDeviceSeen(peerID)
-	log.Printf("[p2p] Connected to %s via %s (%s)", peerID, route, sess.remoteAddr)
+	slog.Info("peer connected", "peer", peerID, "route", route, "addr", sess.remoteAddr)
 
 	if m.handlers.OnPeerState != nil {
 		m.handlers.OnPeerState()
@@ -526,7 +530,7 @@ func (m *Manager) acceptStreamsLoop(ctx context.Context, sess *peerSession) {
 		if m.handlers.OnPeerState != nil {
 			m.handlers.OnPeerState()
 		}
-		log.Printf("[p2p] Disconnected from %s", sess.deviceID)
+		slog.Info("peer disconnected", "peer", sess.deviceID)
 	}()
 
 	for {
@@ -576,6 +580,16 @@ func (m *Manager) dispatchStream(ctx context.Context, sess *peerSession, stream 
 }
 
 func (m *Manager) readControlLoop(ctx context.Context, sess *peerSession, stream *quic.Stream) {
+	// On exit, invalidate the registered control pointer IF this stream was
+	// the registered one, so the next SendControl opens a fresh control
+	// stream on the still-alive connection.
+	defer func() {
+		sess.ctrlMu.Lock()
+		if sess.ctrlStream == stream {
+			sess.ctrlStream = nil
+		}
+		sess.ctrlMu.Unlock()
+	}()
 	for {
 		var env protocol.ControlEnvelope
 		if err := protocol.ReadFrame(stream, &env); err != nil {
@@ -623,12 +637,17 @@ func (m *Manager) SendControl(peerID, msgType string, payload any) error {
 		sess.ctrlStream = stream
 		go m.readControlLoop(m.rootCtx, sess, stream)
 	}
-	_ = sess.ctrlStream.SetWriteDeadline(time.Now().Add(8 * time.Second))
-	err := protocol.WriteControlEnvelope(sess.ctrlStream, msgType, payload)
-	_ = sess.ctrlStream.SetWriteDeadline(time.Time{})
+	stream := sess.ctrlStream
+	_ = stream.SetWriteDeadline(time.Now().Add(8 * time.Second))
+	err := protocol.WriteControlEnvelope(stream, msgType, payload)
+	_ = stream.SetWriteDeadline(time.Time{})
 	if err != nil {
-		// Prevent permanent framing desynchronization after partial write or deadline timeout
-		_ = sess.conn.CloseWithError(3, "control stream write failed")
+		// A partial write / deadline timeout desynchronizes THIS control
+		// stream's framing. Reset only the stream (closing propagates to the
+		// peer's reader, which also drops its pointer via readControlLoop)
+		// and keep the QUIC connection and any in-flight data streams alive.
+		sess.ctrlStream = nil
+		_ = stream.Close()
 	}
 	return err
 }
@@ -997,6 +1016,7 @@ func (m *Manager) RestartRelay() {
 	if ws != nil {
 		_ = ws.Close(websocket.StatusNormalClosure, "config updated")
 	}
+	m.relayRestartRequested.Store(true)
 	select {
 	case m.relayRestartCh <- struct{}{}:
 	default:
@@ -1012,6 +1032,14 @@ func (m *Manager) runRelayClient(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		// Un restart demandé pendant que la boucle était occupée (canal plein)
+		// n'a pas été perdu : on le traite ici avant de reconnecter.
+		if m.relayRestartRequested.Swap(false) {
+			backoff = 2 * time.Second
+			relayIdx = 0
+			failInCycle = 0
+			continue
+		}
 		snap := m.cfg.Snapshot()
 		urls := snap.EffectiveRelayURLs()
 		if len(urls) == 0 {
@@ -1022,6 +1050,7 @@ func (m *Manager) runRelayClient(ctx context.Context) {
 				return
 			case <-m.relayRestartCh:
 				t.Stop()
+				m.relayRestartRequested.Store(false)
 				backoff = 2 * time.Second
 				relayIdx = 0
 				failInCycle = 0
@@ -1054,6 +1083,7 @@ func (m *Manager) runRelayClient(ctx context.Context) {
 			return
 		}
 		if restarted.Load() {
+			m.relayRestartRequested.Store(false)
 			backoff = 2 * time.Second
 			relayIdx = 0
 			failInCycle = 0
@@ -1070,7 +1100,7 @@ func (m *Manager) runRelayClient(ctx context.Context) {
 			failInCycle++
 			if failInCycle < len(urls) {
 				if err != nil && !errors.Is(err, context.Canceled) {
-					log.Printf("[relay-client] %s failed (%v); failing over to next relay...", targetURL, err)
+					slog.Warn("relay connect failed, failing over", "relay", targetURL, "err", err)
 				}
 				t := time.NewTimer(500 * time.Millisecond)
 				select {
@@ -1079,6 +1109,7 @@ func (m *Manager) runRelayClient(ctx context.Context) {
 					return
 				case <-m.relayRestartCh:
 					t.Stop()
+					m.relayRestartRequested.Store(false)
 					backoff = 2 * time.Second
 					failInCycle = 0
 					continue
@@ -1090,7 +1121,7 @@ func (m *Manager) runRelayClient(ctx context.Context) {
 		}
 
 		if err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("[relay-client] Disconnected from %s (%v). Reconnecting in %v...", targetURL, err, backoff)
+			slog.Warn("relay disconnected, reconnecting", "relay", targetURL, "err", err, "backoff", backoff)
 		}
 		t := time.NewTimer(backoff)
 		select {
@@ -1243,7 +1274,7 @@ func (m *Manager) connectAndServeRelay(ctx context.Context, snap config.Settings
 	m.stunToken = regAck.STUNToken
 	m.mu.Unlock()
 	m.setRelayConnected(true, relayURL)
-	log.Printf("[relay-client] Registered on %s (observed=%s, stun_port=%d, udp_relay_port=%d)", relayURL, regAck.ObservedAddr, regAck.STUNPort, regAck.UDPRelayPort)
+	slog.Info("registered on relay", "relay", relayURL, "observed", regAck.ObservedAddr, "stun_port", regAck.STUNPort, "udp_relay_port", regAck.UDPRelayPort)
 
 	// Send authenticated UDP STUN probe from directTr so NAT maps our exact QUIC port
 	sendSTUNProbe := func() {

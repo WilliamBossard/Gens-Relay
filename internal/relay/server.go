@@ -7,7 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
@@ -208,10 +208,10 @@ type Server struct {
 	relayLimKBps int
 	relayLimVer  atomic.Uint64
 
-	ipLimMu     sync.Mutex
-	ipLimiters  map[string]*ipRateEntry
-	authFailMu  sync.Mutex
-	authFails   map[string]*authFailEntry
+	ipLimMu    sync.Mutex
+	ipLimiters map[string]*ipRateEntry
+	authFailMu sync.Mutex
+	authFails  map[string]*authFailEntry
 
 	adminWsMu      sync.Mutex
 	adminWsClients map[*adminWsSub]struct{}
@@ -255,7 +255,7 @@ func NewServer(opts Options) *Server {
 		adminEventCh:     make(chan []byte, 256),
 	}
 	if cfg.Snapshot().AdminPassHash == "" && opts.Config != nil {
-		log.Printf("[relay-server] First-run setup active. Remote setup token: %s", s.setupToken)
+		slog.Info("first-run setup active")
 	}
 	s.refreshLimiter()
 	go s.adminBroadcastLoop()
@@ -750,7 +750,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.cfg.IsBanned(deviceID) {
-		log.Printf("[relay-server] Rejected banned device: %s", deviceID)
+		slog.Warn("rejected banned device", "device", deviceID)
 		_ = writeWSJSON(ctx, ws, protocol.SignalingMessage{Type: protocol.SigError, Error: "device is banned"})
 		return
 	}
@@ -796,7 +796,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	defer connCancel()
 
 	client.startWriter(connCtx)
-	log.Printf("[relay-server] Device connected: %s (%s) observed=%s", deviceID, client.name, observedAddr)
+	slog.Info("device connected", "device", deviceID, "name", client.name, "observed", observedAddr)
 	s.broadcastAdminClients()
 
 	defer func() {
@@ -809,7 +809,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 		s.notifyWatchers(deviceID)
 		s.broadcastAdminClients()
-		log.Printf("[relay-server] Device disconnected: %s", deviceID)
+		slog.Info("device disconnected", "device", deviceID)
 	}()
 
 	udpPort := int(atomic.LoadInt32(&s.stunPort))

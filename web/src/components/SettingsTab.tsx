@@ -12,6 +12,8 @@ export type SettingsFormState = {
   drop_inbox_dir: string;
   max_upload_kbps: number;
   max_download_kbps: number;
+  log_level: string;
+  log_format: string;
   enable_upnp: boolean;
   enable_compression: boolean;
   web_listen: string;
@@ -174,6 +176,30 @@ export function SettingsTab({
               onChange={(e) => setCfgForm({ ...cfgForm, max_download_kbps: Number(e.target.value) })}
               className="w-full bg-[#0b0d11] border border-zinc-700 rounded-md px-3 py-1.5 text-sm"
             />
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-zinc-400 mb-1">Niveau de log</label>
+            <select
+              value={cfgForm.log_level || "info"}
+              onChange={(e) => setCfgForm({ ...cfgForm, log_level: e.target.value })}
+              className="w-full bg-[#0b0d11] border border-zinc-700 rounded-md px-3 py-1.5 text-sm"
+            >
+              <option value="debug">debug (verbeux)</option>
+              <option value="info">info</option>
+              <option value="warn">warn</option>
+              <option value="error">error</option>
+            </select>
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-zinc-400 mb-1">Format log</label>
+            <select
+              value={cfgForm.log_format || "text"}
+              onChange={(e) => setCfgForm({ ...cfgForm, log_format: e.target.value })}
+              className="w-full bg-[#0b0d11] border border-zinc-700 rounded-md px-3 py-1.5 text-sm"
+            >
+              <option value="text">text (console)</option>
+              <option value="json">json (fichier)</option>
+            </select>
           </div>
 
           <div className="sm:col-span-2 flex flex-wrap gap-6 pt-1 text-xs text-zinc-300">

@@ -127,6 +127,14 @@ function resolveApiBase(): string {
   return idx >= 0 ? path.slice(0, idx + 1) : "/";
 }
 
+// Polling adaptatif : rythme de base (10 s, cadence rapide antérieure) et
+// plafond (60 s) de l'intervalle. Quand le WebSocket est ouvert, les
+// événements live suffisent : le polling de secours n'est alors que rarement
+// déclenché, avec un espacement minimal de 30 s (comportement antérieur).
+const POLL_BASE_MS = 10000;
+const POLL_WS_OPEN_MIN_MS = 30000;
+const POLL_MAX_MS = 60000;
+
 export default function App() {
   const [tab, setTab] = useState<"overview" | "clients" | "pairing" | "logs" | "settings">("overview");
   const [setupStatus, setSetupStatus] = useState<SetupStatus | null>(null);
@@ -150,6 +158,11 @@ export default function App() {
   const [bpsHistory, setBpsHistory] = useState<number[]>(new Array(30).fill(0));
   const [toast, setToast] = useState<{ text: string; kind: "ok" | "err" } | null>(null);
   const wsOpenRef = useRef(false);
+  // Polling adaptatif : délai courant, dernier snapshot comparé et garde
+  // anti-superposition des chargements.
+  const pollDelayRef = useRef(POLL_BASE_MS);
+  const lastSnapshotRef = useRef<string | null>(null);
+  const loadingRef = useRef(false);
 
   const [banDeviceInput, setBanDeviceInput] = useState("");
   const [banReasonInput, setBanReasonInput] = useState("");
@@ -195,6 +208,8 @@ export default function App() {
   );
 
   const loadAll = useCallback(async () => {
+    if (loadingRef.current) return;
+    loadingRef.current = true;
     try {
       const ss: SetupStatus = await apiFetch("api/v1/setup/status");
       setSetupStatus(ss);
@@ -232,6 +247,16 @@ export default function App() {
           admin_user: cfg.admin_user || "admin",
         }));
       }
+      // Snapshot stable pour le polling adaptatif : identique au tick
+      // précédent → on espace la prochaine requête (x2, max 60 s) ;
+      // changement détecté → retour au rythme de base (10 s).
+      const snap = JSON.stringify([st, cls, pcs, pqs, banList, logList]);
+      if (snap === lastSnapshotRef.current) {
+        pollDelayRef.current = Math.min(pollDelayRef.current * 2, POLL_MAX_MS);
+      } else {
+        pollDelayRef.current = POLL_BASE_MS;
+      }
+      lastSnapshotRef.current = snap;
     } catch (e: any) {
       if (String(e?.message || "").includes("setup_required")) {
         try {
@@ -241,6 +266,8 @@ export default function App() {
         return;
       }
       console.error(e);
+    } finally {
+      loadingRef.current = false;
     }
   }, [apiFetch]);
 
@@ -282,20 +309,26 @@ export default function App() {
     };
 
     connectWS();
-    const timer = setInterval(() => {
-      if (!wsOpenRef.current) {
-        loadAll();
-      }
-    }, 10000);
-    const slowTimer = setInterval(() => {
-      loadAll();
-    }, 30000);
+    // Polling adaptatif : setTimeout recursive (pas de setInterval imbriqué).
+    // Le délai calculé par loadAll (x2 si inchangé, base si changement) est
+    // lu à chaque planification ; avec le WebSocket ouvert, le polling de
+    // secours est borné à au moins 30 s (les événements live suffisent).
+    // Cleanup : aucun timer orphelin au démontage (stopped + clearTimeout).
+    let pollTimer: number | null = null;
+    const schedulePoll = () => {
+      if (stopped) return;
+      const floor = wsOpenRef.current ? POLL_WS_OPEN_MIN_MS : POLL_BASE_MS;
+      const delay = Math.min(Math.max(pollDelayRef.current, floor), POLL_MAX_MS);
+      pollTimer = window.setTimeout(() => {
+        loadAll().finally(schedulePoll);
+      }, delay);
+    };
+    schedulePoll();
     return () => {
       stopped = true;
       if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+      if (pollTimer !== null) window.clearTimeout(pollTimer);
       ws?.close();
-      clearInterval(timer);
-      clearInterval(slowTimer);
     };
   }, [apiBase, loadAll]);
 

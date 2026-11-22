@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, Copy, FolderSync, Link2, Send, Server, Settings, Terminal } from "lucide-react";
-import { apiFetch } from "./api";
+import { apiFetch, fetchBootstrap } from "./api";
 import { CompactDropApp } from "./components/CompactDropApp";
 import { DaemonOfflineScreen } from "./components/DaemonOfflineScreen";
 import { DevicesTab } from "./components/DevicesTab";
@@ -43,6 +43,10 @@ function isNetworkFailure(err: unknown): boolean {
     msg.includes("http 504")
   );
 }
+
+// Polling adaptatif : rythme de base (5 s) et plafond (60 s) de l'intervalle.
+const POLL_BASE_MS = 5000;
+const POLL_MAX_MS = 60000;
 
 export default function App() {
   const isDropMode = new URLSearchParams(window.location.search).get("mode") === "drop";
@@ -108,6 +112,8 @@ export default function App() {
     drop_inbox_dir: "",
     max_upload_kbps: 0,
     max_download_kbps: 0,
+    log_level: "info",
+    log_format: "text",
     enable_upnp: true,
     enable_compression: true,
     web_listen: "",
@@ -120,6 +126,11 @@ export default function App() {
   const toastTimerRef = useRef<number | null>(null);
   const speedMapRef = useRef<Record<string, { ts: number; bytes: number; bps: number }>>({});
   const notifiedOffersRef = useRef<Set<string>>(new Set());
+  // Polling adaptatif : délai courant, dernier snapshot comparé et garde
+  // anti-superposition des chargements.
+  const pollDelayRef = useRef(POLL_BASE_MS);
+  const lastSnapshotRef = useRef<string | null>(null);
+  const loadingRef = useRef(false);
   const [dropSpeedMap, setDropSpeedMap] = useState<Record<string, number>>({});
 
   const notify = useCallback((text: string, kind: "ok" | "err" = "ok") => {
@@ -167,6 +178,8 @@ export default function App() {
   }, []);
 
   const loadAll = useCallback(async () => {
+    if (loadingRef.current) return;
+    loadingRef.current = true;
     try {
       const ss: SetupStatus = await apiFetch("/api/v1/setup/status");
       setSetupStatus(ss);
@@ -175,34 +188,28 @@ export default function App() {
         return;
       }
 
-      const [st, devs, peers, nearby, reqs, flds, fsts, invs, drops, logList, comp] = await Promise.all([
-        apiFetch("/api/v1/status"),
-        apiFetch("/api/v1/devices"),
-        apiFetch("/api/v1/peers"),
-        apiFetch("/api/v1/peers/nearby"),
-        apiFetch("/api/v1/pair/requests"),
-        apiFetch("/api/v1/folders"),
-        apiFetch("/api/v1/folders/status"),
-        apiFetch("/api/v1/folder-invitations").catch(() => []),
-        apiFetch("/api/v1/drop"),
-        apiFetch("/api/v1/logs"),
-        apiFetch("/api/v1/companion-apps").catch(() => null),
-      ]);
+      // UNE seule requête agrégée remplace les 11 requêtes parallèles de
+      // lecture (GET /api/v1/bootstrap). Les endpoints individuels restent
+      // disponibles pour les actions (POST/PUT) et les refresh ciblés.
+      // Un sous-handler en échec côté backend fait simplement manquer sa clé :
+      // le fallback "|| []" conserve le comportement d'erreur antérieur.
+      const boot = await fetchBootstrap();
+      const st = boot.status;
       setDaemonOffline(false);
       setStoppedByUser(false);
       setOfflineErr("");
-      setStatus(st);
-      setDevices(devs || []);
-      setPeerStatuses(peers || []);
-      setNearbyPeers(nearby || []);
-      setPairRequests(reqs || []);
-      setFolders(flds || []);
-      setFolderStatuses(fsts || []);
-      setFolderInvitations(invs || []);
-      updateDropList(drops || []);
-      setLogs(logList || []);
-      if (comp) setCompanionApps(comp);
-      if (!cfgInitializedRef.current) {
+      if (st) setStatus(st);
+      setDevices(boot.devices || []);
+      setPeerStatuses(boot.peers || []);
+      setNearbyPeers(boot.nearby_peers || []);
+      setPairRequests(boot.pair_requests || []);
+      setFolders(boot.folders || []);
+      setFolderStatuses(boot.folder_status || []);
+      setFolderInvitations(boot.invitations || []);
+      updateDropList(boot.drops || []);
+      setLogs(boot.logs || []);
+      if (boot.companion_apps) setCompanionApps(boot.companion_apps);
+      if (st && !cfgInitializedRef.current) {
         cfgInitializedRef.current = true;
         setCfgForm((prev) => ({
           ...prev,
@@ -212,6 +219,8 @@ export default function App() {
           drop_inbox_dir: st.drop_inbox_dir || "",
           max_upload_kbps: st.max_upload_kbps || 0,
           max_download_kbps: st.max_download_kbps || 0,
+          log_level: st.log_level || "info",
+          log_format: st.log_format || "text",
           enable_upnp: st.enable_upnp ?? true,
           enable_compression: st.enable_compression ?? true,
           web_listen: st.web_listen || "",
@@ -219,6 +228,28 @@ export default function App() {
           web_user: st.web_user || "",
         }));
       }
+      // Snapshot stable pour le polling adaptatif : identique au tick
+      // précédent → on espace la prochaine requête (x2, max 60 s) ;
+      // changement détecté → retour au rythme de base (5 s).
+      const snap = JSON.stringify([
+        boot.status,
+        boot.devices,
+        boot.peers,
+        boot.nearby_peers,
+        boot.pair_requests,
+        boot.folders,
+        boot.folder_status,
+        boot.invitations,
+        boot.drops,
+        boot.logs,
+        boot.companion_apps,
+      ]);
+      if (snap === lastSnapshotRef.current) {
+        pollDelayRef.current = Math.min(pollDelayRef.current * 2, POLL_MAX_MS);
+      } else {
+        pollDelayRef.current = POLL_BASE_MS;
+      }
+      lastSnapshotRef.current = snap;
     } catch (e: any) {
       if (String(e?.message || "").includes("setup_required")) {
         try {
@@ -233,6 +264,8 @@ export default function App() {
         return;
       }
       console.error(e);
+    } finally {
+      loadingRef.current = false;
     }
   }, [updateDropList]);
 
@@ -303,13 +336,24 @@ export default function App() {
     }
 
     connectWS();
-    const timer = setInterval(loadAll, 20000);
+    // Polling adaptatif : setTimeout recursive (pas de setInterval imbriqué).
+    // Le délai lu à chaque planification est celui calculé par loadAll (x2 si
+    // inchangé, base si changement). Cleanup : aucun timer orphelin au
+    // démontage (stopped + clearTimeout).
+    let pollTimer: number | null = null;
+    const schedulePoll = () => {
+      if (stopped) return;
+      pollTimer = window.setTimeout(() => {
+        loadAll().finally(schedulePoll);
+      }, pollDelayRef.current);
+    };
+    schedulePoll();
     return () => {
       stopped = true;
       window.removeEventListener("gens-native-drop", onNativeDrop);
       if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+      if (pollTimer !== null) window.clearTimeout(pollTimer);
       ws?.close();
-      clearInterval(timer);
     };
   }, [isDropMode, loadAll, notify, updateDropList]);
 
@@ -454,6 +498,8 @@ export default function App() {
           drop_inbox_dir: cfgForm.drop_inbox_dir,
           max_upload_kbps: cfgForm.max_upload_kbps,
           max_download_kbps: cfgForm.max_download_kbps,
+          log_level: cfgForm.log_level,
+          log_format: cfgForm.log_format,
           enable_upnp: cfgForm.enable_upnp,
           enable_compression: cfgForm.enable_compression,
           web_listen: cfgForm.web_listen,

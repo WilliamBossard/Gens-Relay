@@ -9,7 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -20,7 +20,6 @@ import (
 	"time"
 
 	"github.com/WilliamBossard/Gens-Relay/internal/chunker"
-	"github.com/WilliamBossard/Gens-Relay/internal/p2p"
 	"github.com/WilliamBossard/Gens-Relay/internal/store"
 	"github.com/WilliamBossard/Gens-Relay/pkg/protocol"
 	"github.com/fsnotify/fsnotify"
@@ -28,6 +27,18 @@ import (
 )
 
 const streamIOTimeout = 30 * time.Second
+
+// P2PSender is the subset of the p2p layer the syncer depends on. It is an
+// interface (satisfied by *p2p.Manager) so tests can inject failures, e.g.
+// a failing SendControl to verify invite/index retry behaviour.
+type P2PSender interface {
+	IsConnected(peerID string) bool
+	SendControl(peerID, msgType string, payload any) error
+	OpenTrackedDataStream(ctx context.Context, peerID string, reqKind protocol.DataRequestKind) (*quic.Stream, func(), error)
+	CompressionEnabled() bool
+	LimitedReadFull(ctx context.Context, r io.Reader, p []byte) (int, error)
+	LimitedWrite(ctx context.Context, w io.Writer, p []byte) (int, error)
+}
 
 type FolderStatus struct {
 	FolderID       string   `json:"folder_id"`
@@ -72,7 +83,7 @@ type folderByteCounter struct {
 type Manager struct {
 	myID    string
 	store   *store.Store
-	p2p     *p2p.Manager
+	p2p     P2PSender
 	onEmit  func(event string, data any)
 	handles *chunker.FileHandleCache
 
@@ -102,7 +113,7 @@ type Manager struct {
 	txBps   atomic.Int64
 }
 
-func NewManager(myID string, st *store.Store, p2pMgr *p2p.Manager, onEmit func(string, any)) *Manager {
+func NewManager(myID string, st *store.Store, p2pMgr P2PSender, onEmit func(string, any)) *Manager {
 	return &Manager{
 		myID:           protocol.NormalizeDeviceID(myID),
 		store:          st,
@@ -469,14 +480,21 @@ func (m *Manager) runScanAndSync(ctx context.Context, folderID string) {
 func (m *Manager) sendFolderIndexBatched(peerID, folderID string, full bool, indexEpoch uint64, list []protocol.FileMetadata) {
 	const maxFilesPerBatch = 350
 	if len(list) == 0 {
-		_ = m.p2p.SendControl(peerID, protocol.CtrlFolderIndex, protocol.FolderIndexMsg{
+		msg := protocol.FolderIndexMsg{
 			FolderID:     folderID,
 			Full:         full,
 			IndexEpoch:   indexEpoch,
 			BatchIndex:   0,
 			TotalBatches: 1,
 			Files:        list,
-		})
+		}
+		// An empty full index carries deletions and has no implicit resync
+		// path, so retry once before giving up.
+		if err := m.p2p.SendControl(peerID, protocol.CtrlFolderIndex, msg); err != nil {
+			if err2 := m.p2p.SendControl(peerID, protocol.CtrlFolderIndex, msg); err2 != nil {
+				slog.Error("empty full index send failed", "folder", folderID, "peer", peerID, "err", err, "retry", err2)
+			}
+		}
 		return
 	}
 	totalBatches := (len(list) + maxFilesPerBatch - 1) / maxFilesPerBatch
@@ -487,7 +505,7 @@ func (m *Manager) sendFolderIndexBatched(peerID, folderID string, full bool, ind
 		if end > len(list) {
 			end = len(list)
 		}
-		if err := m.p2p.SendControl(peerID, protocol.CtrlFolderIndex, protocol.FolderIndexMsg{
+		msg := protocol.FolderIndexMsg{
 			FolderID:     folderID,
 			Full:         full,
 			IndexEpoch:   indexEpoch,
@@ -495,9 +513,14 @@ func (m *Manager) sendFolderIndexBatched(peerID, folderID string, full bool, ind
 			BatchIndex:   i,
 			TotalBatches: totalBatches,
 			Files:        list[start:end],
-		}); err != nil {
-			log.Printf("[syncer] sendFolderIndexBatched(%s -> %s) error: %v", folderID, peerID, err)
-			return
+		}
+		if err := m.p2p.SendControl(peerID, protocol.CtrlFolderIndex, msg); err != nil {
+			// Retry the failed batch once (same BatchID: the receiver's
+			// per-index buffer overwrites the part safely).
+			if err2 := m.p2p.SendControl(peerID, protocol.CtrlFolderIndex, msg); err2 != nil {
+				slog.Error("folder index batch send failed", "folder", folderID, "peer", peerID, "batch", i, "total", totalBatches, "err", err, "retry", err2)
+				return
+			}
 		}
 	}
 }
@@ -543,13 +566,20 @@ func (m *Manager) maybeSendFolderInvite(peerID string, f store.FolderRecord) {
 		suggested = string(protocol.ModeSendOnly)
 	}
 
-	_ = m.p2p.SendControl(peerID, protocol.CtrlFolderInvite, protocol.FolderInviteMsg{
+	if err := m.p2p.SendControl(peerID, protocol.CtrlFolderInvite, protocol.FolderInviteMsg{
 		FolderID:      f.FolderID,
 		Label:         f.Label,
 		SuggestedMode: suggested,
 		FileCount:     fileCount,
 		TotalBytes:    totalBytes,
-	})
+	}); err != nil {
+		// Drop the suppression marker so the invite is retried on the next
+		// connection / folder update instead of staying silently lost.
+		m.mu.Lock()
+		delete(m.invitedSession, key)
+		m.mu.Unlock()
+		slog.Error("folder invite send failed", "peer", peerID, "folder", f.FolderID, "err", err)
+	}
 }
 
 func (m *Manager) OnPeerConnected(ctx context.Context, peerID string) {
@@ -563,7 +593,7 @@ func (m *Manager) OnPeerConnected(ctx context.Context, peerID string) {
 		}
 		knownRemoteSeq, knownRemoteCount, knownRemoteEpoch, _ := m.store.GetPeerRemoteSummary(f.FolderID, peerID)
 		localMaxSeq, localCount, localEpoch, _ := m.store.GetLocalIndexSummaryWithEpoch(f.FolderID)
-		_ = m.p2p.SendControl(peerID, protocol.CtrlFolderSummary, protocol.FolderSummaryMsg{
+		if err := m.p2p.SendControl(peerID, protocol.CtrlFolderSummary, protocol.FolderSummaryMsg{
 			FolderID:         f.FolderID,
 			KnownMaxSeq:      knownRemoteSeq,
 			KnownRemoteCount: knownRemoteCount,
@@ -571,7 +601,9 @@ func (m *Manager) OnPeerConnected(ctx context.Context, peerID string) {
 			LocalMaxSeq:      localMaxSeq,
 			LocalCount:       localCount,
 			LocalIndexEpoch:  localEpoch,
-		})
+		}); err != nil {
+			slog.Error("folder summary send failed", "peer", peerID, "folder", f.FolderID, "err", err)
+		}
 		m.maybeSendFolderInvite(peerID, f)
 	}
 }
@@ -634,6 +666,10 @@ func (m *Manager) HandleFolderIndex(ctx context.Context, peerID string, raw json
 	m.mu.Unlock()
 
 	filesToApply := msg.Files
+	if msg.TotalBatches > 1 && msg.BatchID == "" {
+		slog.Warn("rejecting folder index batch: TotalBatches > 1 but BatchID empty", "peer", peerID, "totalBatches", msg.TotalBatches)
+		return
+	}
 	if msg.TotalBatches > 1 && msg.BatchID != "" {
 		if msg.TotalBatches > 100000 || msg.BatchIndex < 0 || msg.BatchIndex >= msg.TotalBatches {
 			return
@@ -650,7 +686,7 @@ func (m *Manager) HandleFolderIndex(ctx context.Context, peerID string, raw json
 		if !ok {
 			buf = &indexBatchBuffer{
 				total: msg.TotalBatches,
-				parts: make(map[int][]protocol.FileMetadata, msg.TotalBatches),
+				parts: make(map[int][]protocol.FileMetadata),
 			}
 			m.pendingBatches[key] = buf
 		}
@@ -729,7 +765,7 @@ func (m *Manager) HandleFolderInviteReject(peerID string, raw json.RawMessage) {
 	if err := json.Unmarshal(raw, &msg); err != nil {
 		return
 	}
-	log.Printf("[syncer] Peer %s declined shared folder invitation %q", peerID, msg.FolderID)
+	slog.Info("peer declined folder invitation", "peer", peerID, "folder", msg.FolderID)
 }
 
 func (m *Manager) AcceptInvitation(folderID, senderID, localPath string, mode protocol.FolderMode) error {
@@ -779,7 +815,9 @@ func (m *Manager) RejectInvitation(folderID, senderID string) error {
 	if err := m.store.DeleteFolderInvitation(folderID, norm); err != nil {
 		return err
 	}
-	_ = m.p2p.SendControl(norm, protocol.CtrlFolderInviteReject, protocol.FolderInviteRejectMsg{FolderID: folderID})
+	if err := m.p2p.SendControl(norm, protocol.CtrlFolderInviteReject, protocol.FolderInviteRejectMsg{FolderID: folderID}); err != nil {
+		slog.Error("folder invite reject failed", "peer", norm, "folder", folderID, "err", err)
+	}
 	m.emitInvitations()
 	return nil
 }
@@ -968,11 +1006,28 @@ func (m *Manager) reconcileFolderLocked(ctx context.Context, f store.FolderRecor
 	var pullErrors int
 	var lastPullErr error
 
-	lookupHash := func(hash string) (string, bool) {
+	// Rename reuse: when the content being pulled is already present locally
+	// at a path that is deleted in this very reconcile, the matched file can
+	// be moved instead of copied. This is safe under every versioning policy:
+	// the archived "old" content is byte-identical to the live file at the
+	// new path, so the user never loses data by skipping a redundant archive
+	// copy — and the move avoids doubling disk usage for big files.
+	deletionsRel := make(map[string]struct{}, len(deletions))
+	for _, d := range deletions {
+		deletionsRel[d.remote.RelPath] = struct{}{}
+	}
+
+	lookupHash := func(hash string) (rel string, renameOK bool, ok bool) {
 		stateMu.Lock()
-		rel, ok := localByHash[hash]
+		r, found := localByHash[hash]
 		stateMu.Unlock()
-		return rel, ok
+		if !found {
+			return "", false, false
+		}
+		if _, isDel := deletionsRel[r]; isDel {
+			return r, true, true
+		}
+		return r, false, true
 	}
 
 	flushSaved := func(force bool) {
@@ -1022,7 +1077,7 @@ func (m *Manager) reconcileFolderLocked(ctx context.Context, f store.FolderRecor
 		}
 
 		if pullErr != nil {
-			log.Printf("[syncer] folder=%s file=%s pull error: %v", f.FolderID, t.remote.RelPath, pullErr)
+			slog.Error("file pull error", "folder", f.FolderID, "file", t.remote.RelPath, "err", pullErr)
 			stateMu.Lock()
 			pullErrors++
 			lastPullErr = pullErr
@@ -1181,7 +1236,7 @@ func (m *Manager) HandleDataStream(ctx context.Context, peerID string, kind prot
 	}
 }
 
-func (m *Manager) applyRemoteEntry(ctx context.Context, f store.FolderRecord, peerID string, loc, rem protocol.FileMetadata, lookupHash func(string) (string, bool)) (*protocol.FileMetadata, error) {
+func (m *Manager) applyRemoteEntry(ctx context.Context, f store.FolderRecord, peerID string, loc, rem protocol.FileMetadata, lookupHash func(string) (string, bool, bool)) (*protocol.FileMetadata, error) {
 	dstPath, err := safeJoin(f.LocalPath, rem.RelPath)
 	if err != nil {
 		return nil, err
@@ -1193,6 +1248,7 @@ func (m *Manager) applyRemoteEntry(ctx context.Context, f store.FolderRecord, pe
 		if err := ArchiveFile(f.LocalPath, rem.RelPath, f.Versioning, f.KeepVersions); err != nil {
 			return nil, err
 		}
+		_ = os.Remove(filepath.Join(filepath.Dir(dstPath), "."+filepath.Base(dstPath)+".gens.tmp.resume"))
 		res := rem
 		return &res, nil
 	}
@@ -1201,7 +1257,9 @@ func (m *Manager) applyRemoteEntry(ctx context.Context, f store.FolderRecord, pe
 		if info, sErr := os.Stat(dstPath); sErr == nil && !info.IsDir() {
 			m.handles.ClosePath(dstPath)
 			m.markRecentWrite(f.FolderID, dstPath)
-			_ = ArchiveFile(f.LocalPath, rem.RelPath, f.Versioning, f.KeepVersions)
+			if err := ArchiveFile(f.LocalPath, rem.RelPath, f.Versioning, f.KeepVersions); err != nil {
+				slog.Warn("archive before replace failed", "err", err, "path", dstPath)
+			}
 		}
 		m.markRecentWrite(f.FolderID, dstPath)
 		if err := os.MkdirAll(dstPath, 0755); err != nil {
@@ -1218,7 +1276,7 @@ func (m *Manager) applyRemoteEntry(ctx context.Context, f store.FolderRecord, pe
 	return &hydrated, nil
 }
 
-func (m *Manager) resolveAndPullConflict(ctx context.Context, f store.FolderRecord, peerID string, loc, rem protocol.FileMetadata, lookupHash func(string) (string, bool)) (*protocol.FileMetadata, bool, error) {
+func (m *Manager) resolveAndPullConflict(ctx context.Context, f store.FolderRecord, peerID string, loc, rem protocol.FileMetadata, lookupHash func(string) (string, bool, bool)) (*protocol.FileMetadata, bool, error) {
 	remoteWins := rem.MtimeNs > loc.MtimeNs || (rem.MtimeNs == loc.MtimeNs && peerID > m.myID)
 	merged := MergeClocks(loc.Version, rem.Version)
 
@@ -1258,11 +1316,14 @@ func (m *Manager) resolveAndPullConflict(ctx context.Context, f store.FolderReco
 			if err := ArchiveFile(f.LocalPath, rem.RelPath, f.Versioning, f.KeepVersions); err != nil {
 				return nil, false, err
 			}
+			_ = os.Remove(filepath.Join(filepath.Dir(dstPath), "."+filepath.Base(dstPath)+".gens.tmp.resume"))
 		} else if rem.IsDir {
 			if info, sErr := os.Stat(dstPath); sErr == nil && !info.IsDir() {
 				m.handles.ClosePath(dstPath)
 				m.markRecentWrite(f.FolderID, dstPath)
-				_ = ArchiveFile(f.LocalPath, rem.RelPath, f.Versioning, f.KeepVersions)
+				if err := ArchiveFile(f.LocalPath, rem.RelPath, f.Versioning, f.KeepVersions); err != nil {
+					slog.Warn("archive before replace failed", "err", err, "path", dstPath)
+				}
 			}
 			m.markRecentWrite(f.FolderID, dstPath)
 			if err := os.MkdirAll(dstPath, 0755); err != nil {
@@ -1298,7 +1359,7 @@ func (m *Manager) resolveAndPullConflict(ctx context.Context, f store.FolderReco
 	return &out, conflictCreated, nil
 }
 
-func (m *Manager) pullFileContent(ctx context.Context, f store.FolderRecord, peerID string, loc, rem protocol.FileMetadata, dstPath string, lookupHash func(string) (string, bool)) (protocol.FileMetadata, error) {
+func (m *Manager) pullFileContent(ctx context.Context, f store.FolderRecord, peerID string, loc, rem protocol.FileMetadata, dstPath string, lookupHash func(string) (string, bool, bool)) (protocol.FileMetadata, error) {
 	if err := os.MkdirAll(filepath.Dir(dstPath), 0755); err != nil {
 		return rem, err
 	}
@@ -1318,13 +1379,45 @@ func (m *Manager) pullFileContent(ctx context.Context, f store.FolderRecord, pee
 		if info, sErr := os.Stat(dstPath); sErr == nil && !info.IsDir() && info.Size() == rem.Size {
 			m.markRecentWrite(f.FolderID, dstPath)
 			if runtime.GOOS != "windows" && rem.ModeBits != 0 {
-				_ = os.Chmod(dstPath, os.FileMode(rem.ModeBits))
+				_ = os.Chmod(dstPath, safeFileMode(rem.ModeBits))
 			}
 			if rem.MtimeNs > 0 {
 				t := time.Unix(0, rem.MtimeNs)
 				_ = os.Chtimes(dstPath, t, t)
 			}
 			return rem, nil
+		}
+	}
+
+	// Rename reuse: the content is already present locally at a path that is
+	// hard-deleted in this reconcile — move it to the destination instead of
+	// copying (zero network, no doubled disk usage, instant for big files).
+	if rem.FileHash != "" && rem.Size > 0 && lookupHash != nil {
+		if srcRel, renameOK, ok := lookupHash(rem.FileHash); ok {
+			if srcAbs, sErr := safeJoin(f.LocalPath, srcRel); sErr == nil {
+				if renameOK {
+					if _, dErr := os.Stat(dstPath); os.IsNotExist(dErr) {
+						if sInfo, sErr2 := os.Stat(srcAbs); sErr2 == nil && !sInfo.IsDir() && sInfo.Size() == rem.Size {
+							m.handles.ClosePath(srcAbs)
+							m.markRecentWrite(f.FolderID, srcAbs)
+							m.markRecentWrite(f.FolderID, dstPath)
+							if rErr := os.Rename(srcAbs, dstPath); rErr == nil {
+								if runtime.GOOS != "windows" && rem.ModeBits != 0 {
+									_ = os.Chmod(dstPath, safeFileMode(rem.ModeBits))
+								}
+								if rem.MtimeNs > 0 {
+									t := time.Unix(0, rem.MtimeNs)
+									_ = os.Chtimes(dstPath, t, t)
+								}
+								slog.Info("rename-reuse", "from", srcRel, "to", rem.RelPath, "bytes", rem.Size)
+								return rem, nil
+							} else {
+								slog.Warn("rename-reuse failed, falling back to copy", "from", srcRel, "to", rem.RelPath, "err", rErr)
+							}
+						}
+					}
+				}
+			}
 		}
 	}
 
@@ -1338,8 +1431,11 @@ func (m *Manager) pullFileContent(ctx context.Context, f store.FolderRecord, pee
 		}
 	}
 
-	tmpPath := filepath.Join(filepath.Dir(dstPath), fmt.Sprintf(".%s.gens.tmp.%s", filepath.Base(dstPath), randomHex(6)))
-	tmpFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	// Deterministic tmp name so a partially downloaded file survives a failed
+	// pull and resumes block-wise on the next attempt (blocks are reused only
+	// if their BLAKE3 hash still verifies — stale content is never trusted).
+	tmpPath := filepath.Join(filepath.Dir(dstPath), "."+filepath.Base(dstPath)+".gens.tmp.resume")
+	tmpFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return rem, err
 	}
@@ -1353,7 +1449,7 @@ func (m *Manager) pullFileContent(ctx context.Context, f store.FolderRecord, pee
 
 	copiedLocal := false
 	if rem.FileHash != "" && rem.Size > 0 && lookupHash != nil {
-		if srcRel, ok := lookupHash(rem.FileHash); ok {
+		if srcRel, _, ok := lookupHash(rem.FileHash); ok {
 			if srcAbs, sErr := safeJoin(f.LocalPath, srcRel); sErr == nil {
 				if srcF, oErr := os.Open(srcAbs); oErr == nil {
 					n, cErr := io.Copy(tmpFile, srcF)
@@ -1395,6 +1491,20 @@ func (m *Manager) pullFileContent(ctx context.Context, f store.FolderRecord, pee
 			}
 		}
 
+		// Resume: blocks already verified into the deterministic tmp file by a
+		// previous attempt are reusable by hash — a partial transfer continues
+		// where it stopped instead of restarting from block 0.
+		resumeBlocks := make(map[string]protocol.BlockInfo)
+		if tInfo, tErr := os.Stat(tmpPath); tErr == nil && tInfo.Size() > 0 {
+			if existingBlocks, _, _, hErr := chunker.HashFileBlocks(tmpPath, rem.BlockSize); hErr == nil {
+				for _, b := range existingBlocks {
+					if _, dup := localBlocks[b.Hash]; !dup {
+						resumeBlocks[b.Hash] = b
+					}
+				}
+			}
+		}
+
 		var oldFile *os.File
 		if len(localBlocks) > 0 {
 			oldFile, _ = os.Open(dstPath)
@@ -1402,27 +1512,66 @@ func (m *Manager) pullFileContent(ctx context.Context, f store.FolderRecord, pee
 				defer oldFile.Close()
 			}
 		}
+		var resumeFile *os.File
+		if len(resumeBlocks) > 0 {
+			// Read-only: a write-open handle would reserve a write lock that
+			// blocks the final rename on Windows.
+			resumeFile, _ = os.OpenFile(tmpPath, os.O_RDONLY, 0)
+		}
+
+		tryReuse := func(blk protocol.BlockInfo, r io.ReaderAt, blocks map[string]protocol.BlockInfo) (bool, error) {
+			if r == nil {
+				return false, nil
+			}
+			lb, ok := blocks[blk.Hash]
+			if !ok || lb.Size != blk.Size {
+				return false, nil
+			}
+			bufPtr := chunker.GetBufferSize(lb.Size)
+			buf := (*bufPtr)[:lb.Size]
+			n, rErr := r.ReadAt(buf, lb.Offset)
+			if (rErr != nil && rErr != io.EOF) || n != lb.Size {
+				chunker.PutBufferSized(bufPtr)
+				return false, nil
+			}
+			if chunker.HashBytes(buf) != blk.Hash {
+				chunker.PutBufferSized(bufPtr)
+				return false, nil
+			}
+			// Already sitting at the right offset in the resume tmp: no copy needed.
+			if r == resumeFile && lb.Offset == blk.Offset {
+				chunker.PutBufferSized(bufPtr)
+				return true, nil
+			}
+			if _, wErr := tmpFile.WriteAt(buf, blk.Offset); wErr != nil {
+				chunker.PutBufferSized(bufPtr)
+				return false, wErr
+			}
+			chunker.PutBufferSized(bufPtr)
+			return true, nil
+		}
 
 		var missing []protocol.BlockInfo
 		for _, blk := range rem.Blocks {
-			var reused bool
-			if oldFile != nil {
-				if lb, ok := localBlocks[blk.Hash]; ok && lb.Size == blk.Size {
-					bufPtr := chunker.GetBufferSize(lb.Size)
-					buf := (*bufPtr)[:lb.Size]
-					if n, rErr := oldFile.ReadAt(buf, lb.Offset); (rErr == nil || rErr == io.EOF) && n == lb.Size && chunker.HashBytes(buf) == blk.Hash {
-						if _, wErr := tmpFile.WriteAt(buf, blk.Offset); wErr != nil {
-							chunker.PutBufferSized(bufPtr)
-							return rem, wErr
-						}
-						reused = true
-					}
-					chunker.PutBufferSized(bufPtr)
+			reused, wErr := tryReuse(blk, oldFile, localBlocks)
+			if wErr != nil {
+				return rem, wErr
+			}
+			if !reused {
+				reused, wErr = tryReuse(blk, resumeFile, resumeBlocks)
+				if wErr != nil {
+					return rem, wErr
 				}
 			}
 			if !reused {
 				missing = append(missing, blk)
 			}
+		}
+		// Release the resume-tmp handle NOW: any handle left open on the
+		// rename source blocks os.Rename on Windows.
+		if resumeFile != nil {
+			_ = resumeFile.Close()
+			resumeFile = nil
 		}
 
 		if len(missing) > 0 {
@@ -1523,7 +1672,7 @@ func (m *Manager) pullFileContent(ctx context.Context, f store.FolderRecord, pee
 	_ = tmpFile.Close()
 
 	if runtime.GOOS != "windows" && rem.ModeBits != 0 {
-		_ = os.Chmod(tmpPath, os.FileMode(rem.ModeBits))
+		_ = os.Chmod(tmpPath, safeFileMode(rem.ModeBits))
 	}
 	if rem.MtimeNs > 0 {
 		t := time.Unix(0, rem.MtimeNs)
@@ -1539,7 +1688,9 @@ func (m *Manager) pullFileContent(ctx context.Context, f store.FolderRecord, pee
 		if info.IsDir() {
 			// Respect versioning policy when a remote file replaces an existing directory
 			if shouldArchive {
-				_ = ArchiveFile(f.LocalPath, rem.RelPath, f.Versioning, f.KeepVersions)
+				if err := ArchiveFile(f.LocalPath, rem.RelPath, f.Versioning, f.KeepVersions); err != nil {
+					slog.Warn("archive before replace failed", "err", err, "path", dstPath)
+				}
 			} else {
 				_ = os.RemoveAll(dstPath)
 			}
@@ -2012,7 +2163,9 @@ func (m *Manager) RevertLocalChanges(ctx context.Context, folderID string) error
 		if abs, jErr := safeJoin(f.LocalPath, rel); jErr == nil {
 			m.handles.ClosePath(abs)
 			m.markRecentWrite(f.FolderID, abs)
-			_ = ArchiveFile(f.LocalPath, rel, f.Versioning, f.KeepVersions)
+			if err := ArchiveFile(f.LocalPath, rel, f.Versioning, f.KeepVersions); err != nil {
+				slog.Warn("archive before replace failed", "err", err, "path", abs)
+			}
 		}
 	}
 	if len(extraPaths) > 0 {
@@ -2095,7 +2248,7 @@ func (m *Manager) ensureWatcher(f store.FolderRecord) {
 	go func() {
 		watcher, err := fsnotify.NewWatcher()
 		if err != nil {
-			log.Printf("[syncer] fsnotify init failed for %s: %v", f.FolderID, err)
+			slog.Error("fsnotify init failed", "folder", f.FolderID, "err", err)
 			return
 		}
 		defer watcher.Close()
@@ -2180,7 +2333,7 @@ func (m *Manager) ensureWatcher(f store.FolderRecord) {
 					return
 				}
 				if wErr != nil {
-					log.Printf("[syncer] fsnotify watcher error (%s): %v", f.FolderID, wErr)
+					slog.Error("fsnotify watcher error", "folder", f.FolderID, "err", wErr)
 				}
 			}
 		}
@@ -2201,7 +2354,7 @@ func addWatchDirs(w *fsnotify.Watcher, rootDir, startDir string, matcher *Ignore
 		}
 		if err := w.Add(path); err != nil && !warned {
 			warned = true
-			log.Printf("[syncer] fsnotify watch failed for %s (%v) — falling back to periodic rescan", path, err)
+			slog.Warn("fsnotify watch failed, falling back to periodic rescan", "path", path, "err", err)
 		}
 		return nil
 	})
@@ -2370,7 +2523,9 @@ func (m *Manager) ResolveConflict(folderID, conflictRel, action string) error {
 		if err != nil {
 			return err
 		}
-		_ = ArchiveFile(f.LocalPath, origRel, f.Versioning, f.KeepVersions)
+		if err := ArchiveFile(f.LocalPath, origRel, f.Versioning, f.KeepVersions); err != nil {
+			slog.Warn("archive before replace failed", "err", err, "path", origAbs)
+		}
 		if err := os.Rename(conflictAbs, origAbs); err != nil {
 			return err
 		}
@@ -2434,7 +2589,9 @@ func (m *Manager) RestoreVersion(folderID, archivePath string) error {
 		return err
 	}
 	if _, err := os.Stat(dstAbs); err == nil {
-		_ = ArchiveFile(f.LocalPath, origRel, "trashcan", f.KeepVersions)
+		if err := ArchiveFile(f.LocalPath, origRel, "trashcan", f.KeepVersions); err != nil {
+			slog.Warn("archive before replace failed", "err", err, "path", dstAbs)
+		}
 	}
 	if err := moveFileFallback(srcAbs, dstAbs); err != nil {
 		return err

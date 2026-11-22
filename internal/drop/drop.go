@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path"
 	"path/filepath"
@@ -250,6 +251,7 @@ func (m *Manager) SendText(ctx context.Context, peerID, text string) (*store.Dro
 		FileCount:   0,
 	}
 	if err := m.p2p.SendControl(peerID, protocol.CtrlDropOffer, offer); err != nil {
+		slog.Error("drop offer send failed", "peer", peerID, "transfer", rec.TransferID, "err", err)
 		if !m.p2p.IsConnected(peerID) {
 			rec.Status = "queued_offline"
 			rec.TransferredBytes = 0
@@ -593,6 +595,7 @@ func (m *Manager) dispatchOffer(rec *store.DropTransferRecord, fileCount int) er
 		Files:      rec.Files,
 	}
 	if err := m.p2p.SendControl(rec.PeerID, protocol.CtrlDropOffer, offer); err != nil {
+		slog.Error("drop offer dispatch failed", "peer", rec.PeerID, "transfer", rec.TransferID, "err", err)
 		if !m.p2p.IsConnected(rec.PeerID) {
 			rec.Status = "queued_offline"
 			rec.ErrorMsg = ""
@@ -728,6 +731,7 @@ func (m *Manager) RespondOffer(transferID string, accept bool, destDir string) e
 	}
 
 	if !accept {
+		slog.Info("drop offer rejected", "peer", rec.PeerID, "transfer", transferID)
 		rec.Status = "rejected"
 		_ = m.store.UpdateDropProgress(transferID, "rejected", "", rec.TransferredBytes, rec.CompletedBlocks)
 		_ = m.p2p.SendControl(rec.PeerID, protocol.CtrlDropResponse, protocol.DropResponseMsg{
@@ -765,6 +769,7 @@ func (m *Manager) RespondOffer(transferID string, accept bool, destDir string) e
 		TransferID: transferID,
 		Accepted:   true,
 	}); err != nil {
+		slog.Error("drop accept response send failed", "peer", rec.PeerID, "transfer", transferID, "err", err)
 		rec.Status = "pending_accept"
 		_ = m.store.UpdateDropProgress(transferID, "pending_accept", "", rec.TransferredBytes, rec.CompletedBlocks)
 		m.emitUpdateForce()
@@ -774,11 +779,15 @@ func (m *Manager) RespondOffer(transferID string, accept bool, destDir string) e
 	for _, f := range rec.Files {
 		if f.IsDir {
 			if p, err := safeJoin(destDir, f.RelPath); err == nil {
-				_ = os.MkdirAll(p, 0755)
+				if mErr := os.MkdirAll(p, 0755); mErr != nil {
+					slog.Warn("drop: folder creation failed", "err", mErr, "path", p)
+				}
 			}
 		} else if f.Size == 0 {
 			if p, err := safeJoin(destDir, f.RelPath); err == nil {
-				_ = os.MkdirAll(filepath.Dir(p), 0755)
+				if mErr := os.MkdirAll(filepath.Dir(p), 0755); mErr != nil {
+					slog.Warn("drop: parent folder creation failed", "err", mErr, "path", p)
+				}
 				finalEmpty := uniqueDestPath(p)
 				_ = os.WriteFile(finalEmpty, nil, 0644)
 			}
@@ -851,6 +860,7 @@ func (m *Manager) PauseTransfer(transferID string) error {
 		cancel()
 	}
 	if wasTransferring {
+		slog.Info("drop transfer paused", "peer", rec.PeerID, "transfer", transferID)
 		_ = m.p2p.SendControl(rec.PeerID, protocol.CtrlDropPause, protocol.DropPauseMsg{
 			TransferID: transferID,
 			Reason:     "paused by user",
@@ -925,6 +935,7 @@ func (m *Manager) CancelTransfer(transferID string) error {
 		m.cleanupTempFiles(rec)
 	}
 	if !wasLocalOnly {
+		slog.Info("drop transfer canceled", "peer", rec.PeerID, "transfer", transferID)
 		_ = m.p2p.SendControl(rec.PeerID, protocol.CtrlDropCancel, protocol.DropCancelMsg{
 			TransferID: transferID,
 			Reason:     "canceled by user",
@@ -1030,6 +1041,7 @@ func (m *Manager) ResumeTransfer(ctx context.Context, transferID string) error {
 	}
 
 	_ = m.store.UpdateDropProgress(transferID, "transferring", "", rec.TransferredBytes, rec.CompletedBlocks)
+	slog.Info("drop transfer resumed", "peer", rec.PeerID, "transfer", transferID)
 	_ = m.p2p.SendControl(rec.PeerID, protocol.CtrlDropResume, protocol.DropPauseMsg{
 		TransferID: transferID,
 	})
@@ -1318,7 +1330,9 @@ func (m *Manager) cleanupTransferMem(transferID string) {
 		}
 	}
 	if dir != "" {
-		_ = os.RemoveAll(dir)
+		if err := os.RemoveAll(dir); err != nil {
+			slog.Warn("drop: staging dir cleanup failed", "err", err, "path", dir)
+		}
 		_ = m.store.ClearDropStagingDir(transferID)
 	}
 }
@@ -1330,7 +1344,7 @@ func (m *Manager) cleanupTempFiles(rec *store.DropTransferRecord) {
 		}
 		if tmpPath, err := tempTransferPath(rec.DestDir, rec.TransferID, entry.RelPath); err == nil {
 			m.handles.ClosePath(tmpPath)
-			_ = os.Remove(tmpPath)
+			_ = os.Remove(tmpPath) // best effort: le fichier temporaire peut ne plus exister (déjà déplacé ou nettoyé)
 		}
 	}
 }

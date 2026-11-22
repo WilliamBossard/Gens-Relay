@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -978,14 +979,16 @@ func (s *Store) UpsertRemoteFilesWithEpoch(folderID, deviceID string, full bool,
 		}
 	}
 	if epoch > 0 {
-		// Record remote epoch if device is paired (ignore FK error if device isn't inserted in isolated unit tests)
-		_, _ = tx.Exec(`
+		// Record remote epoch if device is paired (FK error possible if device isn't inserted in isolated unit tests)
+		if _, err := tx.Exec(`
 			INSERT INTO peer_folder_state (folder_id, device_id, last_remote_seq, remote_index_epoch)
 			VALUES (?, ?, ?, ?)
 			ON CONFLICT(folder_id, device_id) DO UPDATE SET
 				last_remote_seq = MAX(peer_folder_state.last_remote_seq, excluded.last_remote_seq),
 				remote_index_epoch = excluded.remote_index_epoch
-		`, folderID, deviceID, maxSeq, int64(epoch))
+		`, folderID, deviceID, maxSeq, int64(epoch)); err != nil {
+			slog.Warn("peer_folder_state upsert failed", "err", err)
+		}
 	}
 	return tx.Commit()
 }

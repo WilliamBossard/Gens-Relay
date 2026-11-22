@@ -30,15 +30,26 @@ func ArchiveSourceFile(folderRoot, relPath, src, policy string, keepVersions int
 			return os.RemoveAll(src)
 		}
 		// Archive every file inside the directory before removing the directory tree.
+		// If any file failed to archive, keep the tree and return the first error
+		// instead of deleting data that was not safely archived.
+		var firstErr error
 		_ = filepath.WalkDir(src, func(p string, d os.DirEntry, walkErr error) error {
 			if walkErr != nil || d.IsDir() {
+				if firstErr == nil && walkErr != nil {
+					firstErr = walkErr
+				}
 				return nil
 			}
 			if subRel, rErr := filepath.Rel(folderRoot, p); rErr == nil {
-				_ = ArchiveSourceFile(folderRoot, filepath.ToSlash(subRel), p, policy, keepVersions)
+				if firstErr == nil {
+					firstErr = ArchiveSourceFile(folderRoot, filepath.ToSlash(subRel), p, policy, keepVersions)
+				}
 			}
 			return nil
 		})
+		if firstErr != nil {
+			return firstErr
+		}
 		return os.RemoveAll(src)
 	}
 
@@ -206,7 +217,7 @@ func pruneStaggeredVersions(dir, stem, ext string) {
 		var bucket string
 		switch {
 		case age <= time.Hour:
-			bucket = fmt.Sprintf("m-%d", i)
+			bucket = "m-" + info.ModTime().UTC().Format("200601021504")
 		case age <= 24*time.Hour:
 			bucket = "h-" + info.ModTime().UTC().Format("2006010215")
 		case age <= 30*24*time.Hour:

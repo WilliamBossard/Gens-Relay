@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   AlertTriangle,
   ArrowDownLeft,
@@ -16,6 +16,14 @@ import {
 } from "lucide-react";
 import { apiFetch } from "../api";
 import { DaemonStatus, Device, Folder, FolderInvitation, FolderStatus, PeerStatus, formatBytes } from "../types";
+
+type Stats = {
+  uptime_seconds: number;
+  sync_rx: number;
+  sync_tx: number;
+  drop_rx: number;
+  drop_tx: number;
+};
 
 type Props = {
   status: DaemonStatus | null;
@@ -52,6 +60,34 @@ export function SyncTab({
 }: Props) {
   const [invitePaths, setInvitePaths] = useState<Record<string, string>>({});
   const [inviteModes, setInviteModes] = useState<Record<string, string>>({});
+  const [stats, setStats] = useState<Stats | null>(null);
+
+  useEffect(() => {
+    let live = true;
+    const load = async () => {
+      try {
+        const s: Stats = await apiFetch("/api/v1/stats");
+        if (live) setStats(s);
+      } catch {
+        /* stats are non-critical; keep the last good value */
+      }
+    };
+    load();
+    const t = setInterval(load, 5000);
+    return () => {
+      live = false;
+      clearInterval(t);
+    };
+  }, []);
+
+  const fmtUptime = (s: number) => {
+    const d = Math.floor(s / 86400);
+    const h = Math.floor((s % 86400) / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    if (d > 0) return `${d}j ${h}h`;
+    if (h > 0) return `${h}h ${m}m`;
+    return `${m}m`;
+  };
 
   const allStatuses = Object.values(folderStatusMap);
   const rxBps = allStatuses.reduce((sum, s) => sum + (s?.rx_bps || 0), 0);
@@ -91,6 +127,29 @@ export function SyncTab({
           </button>
         </div>
       </div>
+
+      {stats && (
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+          <div className="bg-[#12161d] border border-zinc-800 rounded-lg px-3.5 py-3">
+            <div className="text-[10px] uppercase tracking-wide text-zinc-500 font-semibold">Reçues (sync)</div>
+            <div className="text-sm font-mono text-zinc-100 mt-1">↓ {formatBytes(stats.sync_rx)}</div>
+          </div>
+          <div className="bg-[#12161d] border border-zinc-800 rounded-lg px-3.5 py-3">
+            <div className="text-[10px] uppercase tracking-wide text-zinc-500 font-semibold">Envoyées (sync)</div>
+            <div className="text-sm font-mono text-zinc-100 mt-1">↑ {formatBytes(stats.sync_tx)}</div>
+          </div>
+          <div className="bg-[#12161d] border border-zinc-800 rounded-lg px-3.5 py-3">
+            <div className="text-[10px] uppercase tracking-wide text-zinc-500 font-semibold">Drop (↓ / ↑)</div>
+            <div className="text-sm font-mono text-zinc-100 mt-1">
+              {formatBytes(stats.drop_rx)} / {formatBytes(stats.drop_tx)}
+            </div>
+          </div>
+          <div className="bg-[#12161d] border border-zinc-800 rounded-lg px-3.5 py-3">
+            <div className="text-[10px] uppercase tracking-wide text-zinc-500 font-semibold">Daemon actif depuis</div>
+            <div className="text-sm font-mono text-zinc-100 mt-1">{fmtUptime(stats.uptime_seconds)}</div>
+          </div>
+        </div>
+      )}
 
       {invitations.length > 0 && (
         <div className="bg-blue-950/25 border border-blue-800/50 rounded-lg p-4 space-y-3">

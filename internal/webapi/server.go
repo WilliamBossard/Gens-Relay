@@ -1,11 +1,13 @@
 package webapi
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -54,9 +56,13 @@ type Server struct {
 	onShutdown    func()
 	shutdownToken string
 	rootCtx       context.Context
+	startedAt     time.Time
 
 	authFailMu sync.Mutex
 	authFails  map[string]*authFailEntry
+
+	setupMu       sync.Mutex
+	setupAttempts map[string]*authFailEntry
 
 	wsMu      sync.Mutex
 	wsClients map[*wsSub]struct{}
@@ -65,17 +71,19 @@ type Server struct {
 
 func NewServer(id *protocol.Identity, cfg *config.DaemonConfig, st *store.Store, p2pMgr *p2p.Manager, syncMgr *syncer.Manager, dropMgr *drop.Manager, logBuf *logs.RingBuffer) *Server {
 	s := &Server{
-		id:        id,
-		cfg:       cfg,
-		store:     st,
-		p2p:       p2pMgr,
-		syncer:    syncMgr,
-		drop:      dropMgr,
-		logs:      logBuf,
-		rootCtx:   context.Background(),
-		authFails: make(map[string]*authFailEntry),
-		wsClients: make(map[*wsSub]struct{}),
-		eventCh:   make(chan []byte, 512),
+		id:            id,
+		cfg:           cfg,
+		store:         st,
+		p2p:           p2pMgr,
+		syncer:        syncMgr,
+		drop:          dropMgr,
+		logs:          logBuf,
+		rootCtx:       context.Background(),
+		startedAt:     time.Now(),
+		authFails:     make(map[string]*authFailEntry),
+		setupAttempts: make(map[string]*authFailEntry),
+		wsClients:     make(map[*wsSub]struct{}),
+		eventCh:       make(chan []byte, 512),
 	}
 	go s.broadcastLoop()
 	return s
@@ -125,12 +133,43 @@ func (s *Server) BroadcastEvent(event string, data any) {
 	}
 }
 
+// handleStats exposes aggregate transfer counters, per-folder status and
+// peer connection state for the UI stats panel.
+func (s *Server) handleStats(w http.ResponseWriter, _ *http.Request) {
+	var syncRx, syncTx, dropRx, dropTx uint64
+	if s.syncer != nil {
+		syncRx, syncTx = s.syncer.TransferCounters()
+	}
+	if s.drop != nil {
+		dropRx, dropTx = s.drop.TransferCounters()
+	}
+	folders := []syncer.FolderStatus{}
+	if s.syncer != nil {
+		folders = s.syncer.Statuses()
+	}
+	peers := []p2p.PeerRuntimeStatus{}
+	if s.p2p != nil {
+		peers = s.p2p.PeerStatuses()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"uptime_seconds": int64(time.Since(s.startedAt).Seconds()),
+		"sync_rx":        syncRx,
+		"sync_tx":        syncTx,
+		"drop_rx":        dropRx,
+		"drop_tx":        dropTx,
+		"peers":          peers,
+		"folders":        folders,
+	})
+}
+
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /api/v1/setup/status", s.handleSetupStatus)
 	mux.HandleFunc("POST /api/v1/setup", s.handleSetupComplete)
+	mux.HandleFunc("GET /api/v1/bootstrap", s.handleBootstrap)
 	mux.HandleFunc("GET /api/v1/status", s.handleStatus)
+	mux.HandleFunc("GET /api/v1/stats", s.handleStats)
 	mux.HandleFunc("POST /api/v1/config", s.handleUpdateConfig)
 	mux.HandleFunc("GET /api/v1/events", s.handleEvents)
 	mux.HandleFunc("GET /api/v1/logs", s.handleLogs)
@@ -202,7 +241,18 @@ func (s *Server) Handler() http.Handler {
 		}))
 	}
 
-	return s.authMiddleware(s.originMiddleware(mux))
+	return s.securityHeaders(s.authMiddleware(s.originMiddleware(mux)))
+}
+
+func (s *Server) securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'")
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "no-referrer")
+		next.ServeHTTP(w, r)
+	})
 }
 
 func isAllowedOrigin(origin, host string) bool {
@@ -233,7 +283,14 @@ func isAllowedOrigin(origin, host string) bool {
 func (s *Server) originMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodDelete || r.Method == http.MethodPatch {
-			if origin := r.Header.Get("Origin"); origin != "" && !isAllowedOrigin(origin, r.Host) {
+			if origin := r.Header.Get("Origin"); origin != "" {
+				if !isAllowedOrigin(origin, r.Host) {
+					writeError(w, http.StatusForbidden, "cross-origin state-changing request forbidden")
+					return
+				}
+			} else if r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+				// Browser request with no Origin but declared cross-site:
+				// reject (CSRF defense-in-depth for browsers that suppress Origin).
 				writeError(w, http.StatusForbidden, "cross-origin state-changing request forbidden")
 				return
 			}
@@ -295,6 +352,45 @@ func (s *Server) recordAuthResult(ip string, ok bool) {
 	ent.count++
 }
 
+// allowSetupAttempt autorise un POST /api/v1/setup tant que l'IP n'a pas
+// dépassé 5 tentatives par fenêtre d'une minute (anti brute-force du setup).
+func (s *Server) allowSetupAttempt(ip string) bool {
+	if ip == "" {
+		return true
+	}
+	now := time.Now()
+	s.setupMu.Lock()
+	defer s.setupMu.Unlock()
+	ent, ok := s.setupAttempts[ip]
+	if !ok || now.After(ent.resetAt) {
+		return true
+	}
+	return ent.count < 5
+}
+
+// recordSetupAttempt incrémente le compteur de tentatives de setup pour l'IP.
+func (s *Server) recordSetupAttempt(ip string) {
+	if ip == "" {
+		return
+	}
+	now := time.Now()
+	s.setupMu.Lock()
+	defer s.setupMu.Unlock()
+	if len(s.setupAttempts) > 1000 {
+		for k, v := range s.setupAttempts {
+			if now.After(v.resetAt) {
+				delete(s.setupAttempts, k)
+			}
+		}
+	}
+	ent, exists := s.setupAttempts[ip]
+	if !exists || now.After(ent.resetAt) {
+		s.setupAttempts[ip] = &authFailEntry{count: 1, resetAt: now.Add(1 * time.Minute)}
+		return
+	}
+	ent.count++
+}
+
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/v1/shutdown" && s.shutdownToken != "" {
@@ -343,23 +439,41 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 }
 
 func (s *Server) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
-	snap := s.cfg.Snapshot()
-	isLoop := isLoopbackRequest(r)
-	needsSetup := snap.WebPassHash == ""
-	resp := map[string]any{
-		"needs_setup": needsSetup,
-		"is_loopback": isLoop,
-	}
+	needsSetup := s.cfg.Snapshot().WebPassHash == ""
 	if needsSetup {
-		resp["web_user"] = snap.WebUser
-		resp["node_name"] = snap.NodeName
-		resp["drop_inbox_dir"] = snap.DropInboxDir
-		resp["relay_url"] = snap.RelayURL
+		// Pré-setup : ne divulguer AUCUNE information (nom de nœud, chemins,
+		// relay, utilisateur) à un client distant — uniquement l'état du setup.
+		writeJSON(w, http.StatusOK, map[string]any{"needs_setup": true})
+		return
 	}
-	writeJSON(w, http.StatusOK, resp)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"needs_setup": false,
+		"is_loopback": isLoopbackRequest(r),
+	})
 }
 
+// maxDropUploadBytes borne les uploads multipart QuickDrop côté navigateur
+// (aucune limite de taille de drop n'existe dans DaemonConfig : 10 GiB par défaut).
+const maxDropUploadBytes int64 = 10 * 1024 * 1024 * 1024
+
 func (s *Server) handleSetupComplete(w http.ResponseWriter, r *http.Request) {
+	// Le setup définit le compte administrateur du daemon : il ne doit être
+	// possible QUE depuis la boucle locale (127.0.0.1/::1), sinon un attaquant
+	// distant (Docker/TrueNAS exposés sur 0.0.0.0:8385) peut créer le compte
+	// admin avant l'utilisateur légitime.
+	if !isLoopbackRequest(r) {
+		writeError(w, http.StatusForbidden, "setup allowed only from loopback")
+		return
+	}
+	ipStr := ""
+	if ip := remoteIP(r); ip != nil {
+		ipStr = ip.String()
+	}
+	if !s.allowSetupAttempt(ipStr) {
+		http.Error(w, "Trop de tentatives de configuration", http.StatusTooManyRequests)
+		return
+	}
+	s.recordSetupAttempt(ipStr)
 	if s.cfg.Snapshot().WebPassHash != "" {
 		writeError(w, http.StatusConflict, "setup already completed")
 		return
@@ -497,6 +611,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"drop_inbox_dir":       snap.DropInboxDir,
 		"max_upload_kbps":      snap.MaxUploadKBps,
 		"max_download_kbps":    snap.MaxDownloadKBps,
+		"log_level":            snap.LogLevel,
+		"log_format":           snap.LogFormat,
 		"enable_upnp":          snap.EnableUPnP,
 		"enable_compression":   snap.EnableCompression,
 		"web_listen":           snap.WebListen,
@@ -516,6 +632,8 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		DropInboxDir      string    `json:"drop_inbox_dir"`
 		MaxUploadKBps     *int      `json:"max_upload_kbps"`
 		MaxDownloadKBps   *int      `json:"max_download_kbps"`
+		LogLevel          *string   `json:"log_level"`
+		LogFormat         *string   `json:"log_format"`
 		EnableUPnP        *bool     `json:"enable_upnp"`
 		EnableCompression *bool     `json:"enable_compression"`
 		WebListen         string    `json:"web_listen"`
@@ -554,6 +672,12 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		if body.MaxDownloadKBps != nil && *body.MaxDownloadKBps >= 0 {
 			c.MaxDownloadKBps = *body.MaxDownloadKBps
 		}
+		if body.LogLevel != nil && *body.LogLevel != "" {
+			c.LogLevel = *body.LogLevel
+		}
+		if body.LogFormat != nil && *body.LogFormat != "" {
+			c.LogFormat = *body.LogFormat
+		}
 		if body.EnableUPnP != nil {
 			c.EnableUPnP = *body.EnableUPnP
 		}
@@ -589,6 +713,9 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	needsRestart := newSnap.WebListen != prevSnap.WebListen || newSnap.WebTLS != prevSnap.WebTLS || newSnap.EnableUPnP != prevSnap.EnableUPnP
 	s.p2p.RefreshRateLimiters()
 	s.p2p.RestartRelay()
+	if newSnap.LogLevel != prevSnap.LogLevel || newSnap.LogFormat != prevSnap.LogFormat {
+		logs.Apply(newSnap.LogLevel, newSnap.LogFormat)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "needs_restart": needsRestart})
 }
 
@@ -1297,8 +1424,20 @@ func (h *streamingBlockHasher) Finish() ([]protocol.BlockInfo, string, int64) {
 }
 
 func (s *Server) handleDropUpload(w http.ResponseWriter, r *http.Request) {
+	// Borne la taille du body multipart (MaxBytesReader) : un upload au-delà de
+	// maxDropUploadBytes provoque une erreur http.ErrBodyTooLarge gérée en 413.
+	if r.Body != nil {
+		if maxBody := http.MaxBytesReader(w, r.Body, maxDropUploadBytes); maxBody != nil {
+			r.Body = maxBody
+		}
+	}
 	mr, err := r.MultipartReader()
 	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, "upload trop volumineux")
+			return
+		}
 		writeError(w, http.StatusBadRequest, "invalid multipart upload: "+err.Error())
 		return
 	}
@@ -1377,6 +1516,11 @@ func (s *Server) handleDropUpload(w http.ResponseWriter, r *http.Request) {
 				_, _, _ = hasher.Finish()
 				_ = f.Close()
 				_ = part.Close()
+				var maxErr *http.MaxBytesError
+				if errors.As(err, &maxErr) {
+					writeError(w, http.StatusRequestEntityTooLarge, "upload trop volumineux")
+					return
+				}
 				writeError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
@@ -1478,7 +1622,142 @@ func (s *Server) handleShutdown(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
+// handleBootstrap agrège en UNE seule réponse JSON les données des 11 endpoints
+// chargés en parallèle par le frontend au démarrage (status, devices, peers,
+// nearby, pair-requests, folders, folder-status, invitations, drops, logs,
+// companion-apps). Les valeurs sont obtenues via un recorder interne, sans
+// dupliquer la logique des handlers existants.
+func (s *Server) handleBootstrap(w http.ResponseWriter, r *http.Request) {
+	call := func(path string) (any, bool) {
+		rec := httptestRecorder{}
+		sub, err := http.NewRequest(http.MethodGet, path, nil)
+		if err != nil {
+			return nil, false
+		}
+		sub = sub.WithContext(r.Context())
+		sub.RemoteAddr = r.RemoteAddr
+		for k, vals := range r.Header {
+			sub.Header[k] = append([]string(nil), vals...)
+		}
+		s.routeBootstrap(r, path, &rec, sub)
+		if rec.code != http.StatusOK {
+			return nil, false
+		}
+		var v any
+		if err := json.Unmarshal(rec.body.Bytes(), &v); err != nil {
+			return nil, false
+		}
+		return v, true
+	}
+
+	resp := map[string]any{}
+	if v, ok := call("/api/v1/status"); ok {
+		resp["status"] = v
+	}
+	if v, ok := call("/api/v1/devices"); ok {
+		resp["devices"] = v
+	}
+	if v, ok := call("/api/v1/peers"); ok {
+		resp["peers"] = v
+	}
+	if v, ok := call("/api/v1/peers/nearby"); ok {
+		resp["nearby_peers"] = v
+	}
+	if v, ok := call("/api/v1/pair/requests"); ok {
+		resp["pair_requests"] = v
+	}
+	if v, ok := call("/api/v1/folders"); ok {
+		resp["folders"] = v
+	}
+	if v, ok := call("/api/v1/folders/status"); ok {
+		resp["folder_status"] = v
+	}
+	if v, ok := call("/api/v1/folder-invitations"); ok {
+		resp["invitations"] = v
+	}
+	if v, ok := call("/api/v1/drop"); ok {
+		resp["drops"] = v
+	}
+	if v, ok := call("/api/v1/logs"); ok {
+		resp["logs"] = v
+	}
+	if v, ok := call("/api/v1/companion-apps"); ok {
+		resp["companion_apps"] = v
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// routeBootstrap appelle le handler d'un endpoint GET existant sans repasser
+// par le middleware d'authentification (le bootstrap est déjà authentifié).
+func (s *Server) routeBootstrap(_ *http.Request, path string, rec *httptestRecorder, sub *http.Request) {
+	switch path {
+	case "/api/v1/status":
+		s.handleStatus(rec, sub)
+	case "/api/v1/devices":
+		s.handleListDevices(rec, sub)
+	case "/api/v1/peers":
+		s.handlePeers(rec, sub)
+	case "/api/v1/peers/nearby":
+		s.handleNearbyPeers(rec, sub)
+	case "/api/v1/pair/requests":
+		s.handleListPairRequests(rec, sub)
+	case "/api/v1/folders":
+		s.handleListFolders(rec, sub)
+	case "/api/v1/folders/status":
+		s.handleFolderStatuses(rec, sub)
+	case "/api/v1/folder-invitations":
+		s.handleListFolderInvitations(rec, sub)
+	case "/api/v1/drop":
+		s.handleDropList(rec, sub)
+	case "/api/v1/logs":
+		s.handleLogs(rec, sub)
+	case "/api/v1/companion-apps":
+		s.handleCompanionApps(rec, sub)
+	default:
+		rec.write(http.StatusNotFound, []byte(`{"error":"unknown bootstrap endpoint"}`))
+	}
+}
+
+// httptestRecorder est un http.ResponseWriter minimal utilisé par le handler
+// de bootstrap pour capturer les réponses des handlers GET internes.
+type httptestRecorder struct {
+	header http.Header
+	body   bytes.Buffer
+	code   int
+}
+
+func (r *httptestRecorder) Header() http.Header {
+	if r.header == nil {
+		r.header = http.Header{}
+	}
+	return r.header
+}
+
+func (r *httptestRecorder) Write(b []byte) (int, error) {
+	return r.body.Write(b)
+}
+
+func (r *httptestRecorder) WriteHeader(code int) {
+	r.code = code
+}
+
+func (r *httptestRecorder) write(code int, b []byte) {
+	r.code = code
+	_, _ = r.body.Write(b)
+}
+
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	// Si le mot de passe Web est configuré, /metrics exige les mêmes
+	// credentials Basic que le reste de l'API (cohérent avec l'état post-setup).
+	snap := s.cfg.Snapshot()
+	if snap.WebPassHash != "" {
+		user, pass, ok := r.BasicAuth()
+		if !ok || !s.cfg.VerifyWebAuth(user, pass) {
+			w.Header().Set("WWW-Authenticate", `Basic realm="Gens-Relay"`)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+	}
 	peers := s.p2p.ConnectedPeerIDs()
 	folders := s.syncer.Statuses()
 	syncRx, syncTx := s.syncer.TransferCounters()

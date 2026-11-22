@@ -302,7 +302,7 @@ func TestWebAPISetupWizardRateLimitInvitationsAndOfflineUpload(t *testing.T) {
 		t.Fatalf("expected 403 setup_required for remote request, got %d (%s)", rec.Code, rec.Body.String())
 	}
 
-	// Check /api/v1/setup/status
+	// Check /api/v1/setup/status (remote : ne doit exposer QUE needs_setup)
 	req = httptest.NewRequest(http.MethodGet, "/api/v1/setup/status", nil)
 	req.RemoteAddr = "198.51.100.42:55000"
 	rec = httptest.NewRecorder()
@@ -310,16 +310,37 @@ func TestWebAPISetupWizardRateLimitInvitationsAndOfflineUpload(t *testing.T) {
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"needs_setup":true`) {
 		t.Fatalf("expected setup status needs_setup=true, got %d (%s)", rec.Code, rec.Body.String())
 	}
+	if strings.Contains(rec.Body.String(), "web_user") || strings.Contains(rec.Body.String(), "drop_inbox_dir") || strings.Contains(rec.Body.String(), "relay_url") || strings.Contains(rec.Body.String(), "node_name") {
+		t.Fatalf("setup/status pré-setup ne doit exposer aucun champ supplémentaire : %s", rec.Body.String())
+	}
 
-	// Non-loopback cannot call /api/v1/open-path even after setup; check before & after
+	// 2b. POST /api/v1/setup depuis une IP NON-loopback doit être refusé (403)
 	inboxDir := filepath.Join(dir, "inbox")
 	setupPayload := fmt.Sprintf(`{"web_user":"admin","web_password":"secret-password-99","node_name":"TrueNASBox","drop_inbox_dir":%q}`, inboxDir)
 	req = httptest.NewRequest(http.MethodPost, "/api/v1/setup", strings.NewReader(setupPayload))
 	req.RemoteAddr = "198.51.100.42:55000"
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for non-loopback POST /setup, got %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	// 2c. POST /api/v1/setup depuis loopback réussit
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/setup", strings.NewReader(setupPayload))
+	req.RemoteAddr = "127.0.0.1:41000"
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("POST /api/v1/setup failed: %d (%s)", rec.Code, rec.Body.String())
+		t.Fatalf("POST /api/v1/setup (loopback) failed: %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	// 2d. POST /api/v1/setup depuis une IP distante APRÈS setup → 409 (déjà complété)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/setup", strings.NewReader(setupPayload))
+	req.RemoteAddr = "203.0.113.7:55000"
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden && rec.Code != http.StatusConflict {
+		t.Fatalf("expected 403/409 for remote POST /setup after setup, got %d (%s)", rec.Code, rec.Body.String())
 	}
 
 	// 3. Re-running setup returns 409 Conflict
@@ -359,6 +380,24 @@ func TestWebAPISetupWizardRateLimitInvitationsAndOfflineUpload(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 with valid auth, got %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	// 4b. /metrics post-setup : protégé par Basic auth (401 sans, 200 avec)
+	// (IP distincte de 198.51.100.42 qui est déjà bloquée par le rate-limit d'auth)
+	req = httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	req.RemoteAddr = "198.51.100.77:55000"
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on /metrics post-setup, got %d", rec.Code)
+	}
+	req = httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	req.RemoteAddr = "198.51.100.77:55000"
+	req.SetBasicAuth("admin", "secret-password-99")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 on /metrics with valid auth, got %d", rec.Code)
 	}
 
 	// 5. Loopback restriction on /api/v1/open-path
@@ -437,5 +476,35 @@ func TestWebAPISetupWizardRateLimitInvitationsAndOfflineUpload(t *testing.T) {
 	}
 	if upRec.Status != "queued_offline" || len(upRec.Files) != 1 || upRec.Files[0].FileHash == "" {
 		t.Fatalf("unexpected inline prehashed upload result: %+v", upRec)
+	}
+
+	// 9. GET /api/v1/bootstrap agrège les 11 endpoints de démarrage du frontend
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/bootstrap", nil)
+	req.RemoteAddr = "127.0.0.1:41000"
+	req.SetBasicAuth("admin", "secret-password-99")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1/bootstrap failed: %d (%s)", rec.Code, rec.Body.String())
+	}
+	var boot map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &boot); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"status", "devices", "peers", "nearby_peers", "pair_requests", "folders", "folder_status", "invitations", "drops", "logs", "companion_apps"} {
+		if _, ok := boot[key]; !ok {
+			t.Fatalf("bootstrap réponse manque la clé %q : %s", key, rec.Body.String())
+		}
+	}
+	if stVal, ok := boot["status"].(map[string]any); !ok || stVal["device_id"] != id.DeviceID {
+		t.Fatalf("bootstrap status inattendu: %v", boot["status"])
+	}
+	// Le bootstrap doit être authentifié : requête anonyme → 401
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/bootstrap", nil)
+	req.RemoteAddr = "127.0.0.1:41000"
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on unauthenticated bootstrap, got %d", rec.Code)
 	}
 }

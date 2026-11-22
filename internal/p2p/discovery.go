@@ -5,7 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"time"
 
@@ -190,7 +190,7 @@ func (m *Manager) runLANDiscovery(ctx context.Context) {
 			if err != nil {
 				if !warned {
 					warned = true
-					log.Printf("[p2p] LAN discovery UDP :%d unavailable (%v); retrying in background (change discovery_port if Syncthing is running)", port, err)
+					slog.Warn("LAN discovery UDP unavailable, retrying in background", "port", port, "err", err)
 				}
 				select {
 				case <-ctx.Done():

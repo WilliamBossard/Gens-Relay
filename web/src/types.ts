@@ -103,6 +103,8 @@ export type DaemonStatus = {
   drop_inbox_dir: string;
   max_upload_kbps: number;
   max_download_kbps: number;
+  log_level?: string;
+  log_format?: string;
   enable_upnp?: boolean;
   enable_compression?: boolean;
   web_listen: string;
@@ -134,6 +136,24 @@ export type LogEntry = {
   id: number;
   timestamp: number;
   message: string;
+};
+
+// Réponse agrégée de GET /api/v1/bootstrap : une seule requête contenant les
+// 11 snapshots de lecture chargés précédemment en parallèle. Les clés
+// absentes (null/undefined) correspondent à un sous-handler en erreur —
+// le frontend applique alors ses valeurs par défaut (|| []).
+export type Bootstrap = {
+  status?: DaemonStatus | null;
+  devices?: Device[] | null;
+  peers?: PeerStatus[] | null;
+  nearby_peers?: NearbyPeer[] | null;
+  pair_requests?: PairRequest[] | null;
+  folders?: Folder[] | null;
+  folder_status?: FolderStatus[] | null;
+  invitations?: FolderInvitation[] | null;
+  drops?: DropTransfer[] | null;
+  logs?: LogEntry[] | null;
+  companion_apps?: CompanionAppsInfo | null;
 };
 
 export type ConflictItem = {

@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"crypto/rand"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/WilliamBossard/Gens-Relay/internal/chunker"
 	"github.com/WilliamBossard/Gens-Relay/internal/config"
 	"github.com/WilliamBossard/Gens-Relay/internal/p2p"
 	"github.com/WilliamBossard/Gens-Relay/internal/store"
@@ -365,6 +368,211 @@ type testNode struct {
 	store *store.Store
 	p2p   *p2p.Manager
 	sync  *Manager
+}
+
+// TestRenameReuseMovesLocalFile verifies that a file renamed on A (delete old
+// + create new, same content) converges on B WITHOUT any data download and by
+// MOVING the local file (rename-reuse) instead of copying it, regardless of
+// the versioning policy.
+func TestRenameReuseMovesLocalFile(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	// Capture the default slog logger to prove the rename-reuse path ran on B.
+	oldLogger := slog.Default()
+	var logBuf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+	t.Cleanup(func() {
+		slog.SetDefault(oldLogger)
+		if t.Failed() {
+			t.Logf("captured logs:\n%s", logBuf.String())
+		}
+	})
+
+	nodeA := newTestNode(t, ctx, "RenA")
+	nodeB := newTestNode(t, ctx, "RenB")
+
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	const folderID = "rename"
+	_ = nodeA.store.UpsertDevice(store.DeviceRecord{DeviceID: nodeB.id.DeviceID, Name: "RenB"})
+	_ = nodeB.store.UpsertDevice(store.DeviceRecord{DeviceID: nodeA.id.DeviceID, Name: "RenA"})
+	_ = nodeA.store.UpsertFolder(store.FolderRecord{
+		FolderID:  folderID,
+		Label:     "Rename",
+		LocalPath: dirA,
+		Mode:      protocol.ModeSendReceive,
+		Peers:     []string{nodeB.id.DeviceID},
+	})
+	_ = nodeB.store.UpsertFolder(store.FolderRecord{
+		FolderID:  folderID,
+		Label:     "Rename",
+		LocalPath: dirB,
+		Mode:      protocol.ModeSendReceive,
+		Peers:     []string{nodeA.id.DeviceID},
+	})
+
+	// Deterministic 1 MiB payload.
+	content := make([]byte, 1024*1024)
+	for i := range content {
+		content[i] = byte(i % 251)
+	}
+	if err := os.WriteFile(filepath.Join(dirA, "old.bin"), content, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	nodeA.sync.Start(ctx)
+	nodeB.sync.Start(ctx)
+
+	// Establish the direct QUIC link (test harness has no LAN discovery).
+	nodeA.p2p.SetPeerEndpoint(nodeB.id.DeviceID, "RenB", fmt.Sprintf("127.0.0.1:%d", nodeB.p2p.QUICPort()))
+
+	waitUntil(t, 15*time.Second, func() bool {
+		_, err := os.Stat(filepath.Join(dirB, "old.bin"))
+		return err == nil
+	}, "initial sync delivers old.bin to B")
+
+	rxBefore, _ := nodeB.sync.TransferCounters()
+
+	// A renames old.bin -> new.bin. B must converge with new.bin (same
+	// content), old.bin gone, and zero data transferred for it.
+	if err := os.Rename(filepath.Join(dirA, "old.bin"), filepath.Join(dirA, "new.bin")); err != nil {
+		t.Fatal(err)
+	}
+
+	waitUntil(t, 20*time.Second, func() bool {
+		_, nErr := os.Stat(filepath.Join(dirB, "new.bin"))
+		_, oErr := os.Stat(filepath.Join(dirB, "old.bin"))
+		if nErr != nil || !os.IsNotExist(oErr) {
+			return false
+		}
+		b, rErr := os.ReadFile(filepath.Join(dirB, "new.bin"))
+		return rErr == nil && bytes.Equal(b, content)
+	}, "rename converges on B (new.bin same content, old.bin gone)")
+
+	rxAfter, _ := nodeB.sync.TransferCounters()
+	if rxAfter != rxBefore {
+		t.Fatalf("rename must not download data: B received %d extra bytes", rxAfter-rxBefore)
+	}
+	if !bytes.Contains(logBuf.Bytes(), []byte("rename-reuse from=")) {
+		t.Fatal("expected the rename-reuse optimization to run (no successful 'rename-reuse' log line)")
+	}
+}
+
+// TestPartialTmpResumesWithoutRefetch verifies resumable transfers: when a
+// previous pull left a partial .gens.tmp.resume file behind, the next pull
+// reuses the blocks already present in it (verified by BLAKE3) and only
+// fetches the missing ones — instead of re-downloading the whole file.
+func TestPartialTmpResumesWithoutRefetch(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	nodeA := newTestNode(t, ctx, "WinNode")
+	nodeB := newTestNode(t, ctx, "NASNode")
+
+	if err := nodeA.store.UpsertDevice(store.DeviceRecord{DeviceID: nodeB.id.DeviceID, Name: "NAS"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := nodeB.store.UpsertDevice(store.DeviceRecord{DeviceID: nodeA.id.DeviceID, Name: "Win"}); err != nil {
+		t.Fatal(err)
+	}
+
+	dirA := filepath.Join(t.TempDir(), "win-sync")
+	dirB := filepath.Join(t.TempDir(), "nas-sync")
+	_ = os.MkdirAll(dirA, 0755)
+	_ = os.MkdirAll(dirB, 0755)
+
+	if err := nodeA.store.UpsertFolder(store.FolderRecord{
+		FolderID:  "resume-fold",
+		Label:     "Resume",
+		LocalPath: dirA,
+		Mode:      protocol.ModeSendOnly,
+		Peers:     []string{nodeB.id.DeviceID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := nodeB.store.UpsertFolder(store.FolderRecord{
+		FolderID:   "resume-fold",
+		Label:      "Resume",
+		LocalPath:  dirB,
+		Mode:       protocol.ModeReceiveOnly,
+		Peers:      []string{nodeA.id.DeviceID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 10 distinct incompressible 256 KiB blocks (2.5 MiB file → adaptive
+	// block size 256 KiB). Random bytes so wire size ≈ raw size (Zstd cannot
+	// cheat the transfer assertions).
+	const blocks = 10
+	const blkSize = 256 * 1024
+	content := make([]byte, blocks*blkSize)
+	if _, err := rand.Read(content); err != nil {
+		t.Fatal(err)
+	}
+	fileA := filepath.Join(dirA, "big.bin")
+	if err := os.WriteFile(fileA, content, 0644); err != nil {
+		t.Fatal(err)
+	}
+	srcBlocks, _, _, err := chunker.HashFileBlocks(fileA, 0)
+	if err != nil || len(srcBlocks) != blocks {
+		t.Fatalf("expected %d blocks, got %d (err=%v)", blocks, len(srcBlocks), err)
+	}
+
+	// Simulate a previously interrupted transfer on B: half the blocks are
+	// already in the deterministic resume tmp (note the leading dot, which
+	// matches the name used by pullFileContent), the rest are zero.
+	tmpB := filepath.Join(dirB, ".big.bin.gens.tmp.resume")
+	tmpFile, err := os.OpenFile(tmpB, os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tmpFile.Truncate(int64(blocks) * blkSize); err != nil {
+		tmpFile.Close()
+		t.Fatal(err)
+	}
+	const seeded = 5
+	for _, b := range srcBlocks[:seeded] {
+		if _, err := tmpFile.WriteAt(content[b.Offset:b.Offset+int64(b.Size)], b.Offset); err != nil {
+			tmpFile.Close()
+			t.Fatal(err)
+		}
+	}
+	tmpFile.Close()
+
+	rxBefore, _ := nodeB.sync.TransferCounters()
+
+	nodeA.sync.Start(ctx)
+	nodeB.sync.Start(ctx)
+	nodeA.p2p.SetPeerEndpoint(nodeB.id.DeviceID, "NAS", fmt.Sprintf("127.0.0.1:%d", nodeB.p2p.QUICPort()))
+
+	targetFile := filepath.Join(dirB, "big.bin")
+	waitUntil(t, 15*time.Second, func() bool {
+		got, err := os.ReadFile(targetFile)
+		return err == nil && bytes.Equal(got, content)
+	}, "resumed transfer completes with the correct content")
+
+	// The resume tmp must have been consumed (renamed into place).
+	if _, err := os.Stat(tmpB); !os.IsNotExist(err) {
+		entries, _ := os.ReadDir(dirB)
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("expected the resume tmp to be gone after success, stat err=%v dirB=%v", err, names)
+	}
+
+	// Only the unseeded blocks may have been transferred: at least the 5
+	// missing blocks (incompressible → wire ≈ raw), and strictly less than
+	// the full file (already-present blocks must not be re-downloaded).
+	rxAfter, _ := nodeB.sync.TransferCounters()
+	delta := int64(rxAfter - rxBefore)
+	if delta < int64(blocks-seeded)*blkSize {
+		t.Fatalf("expected at least %d fetched bytes (missing blocks), got %d", (blocks-seeded)*blkSize, delta)
+	}
+	if delta > int64(blocks)*blkSize*105/100 {
+		t.Fatalf("resume must not re-download already-present blocks: fetched %d for a %d-byte file", delta, len(content))
+	}
 }
 
 func newTestNode(t *testing.T, ctx context.Context, name string) *testNode {

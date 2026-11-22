@@ -29,7 +29,7 @@ Gens-Relay combines continuous folder synchronization (bidirectional and unidire
 ### Continuous Folder Synchronization
 - **Independent Local Paths**: Peers share a logical `FolderID` while each machine maps it to its own local directory (e.g., Windows `C:\Users\...` synced to TrueNAS `/mnt/tank/...`).
 - **Sync Modes**: `send_receive` (bidirectional), `send_only` (with remote override), and `receive_only` (with local revert).
-- **Delta Transfers**: Files are split into 512 KiB blocks hashed with **BLAKE3**; unchanged local blocks are reused before pulling missing blocks.
+- **Delta Transfers**: Files are split into adaptive **BLAKE3** blocks (256 KiB up to 16 MiB, chosen by file size via `AdaptiveBlockSize`); unchanged local blocks are reused before pulling missing blocks.
 - **Fast Scanning & Live Watching**: 16-worker parallel scanner with `(size, mtime_ns)` fast-checks combined with `fsnotify` real-time watching (500 ms debounce).
 - **Safety & Versioning**: Atomic temporary writes (`.gens.tmp.*`), deterministic conflict preservation (`*.sync-conflict-*`), `.gensignore` exclusion rules (with `!` negations), and configurable file versioning (`none`, `trashcan`, `simple`, `staggered` under `.gensversions/`).
 
@@ -54,17 +54,20 @@ Gens-Relay/
 │   └── relay-server/        # Coordination & signaling server
 ├── pkg/protocol/            # Ed25519 identity, signaling envelopes, QUIC wire framing
 ├── internal/
-│   ├── chunker/             # 512 KiB BLAKE3 block hashing & verification
+│   ├── chunker/             # 256 KiB–16 MiB adaptive BLAKE3 block hashing & verification
 │   ├── config/              # Daemon configuration & temp cleanup
 │   ├── drop/                # QuickDrop ad-hoc transfer engine
 │   ├── lock/                # Atomic process lockfile with heartbeat
 │   ├── p2p/                 # QUIC mTLS transport, LAN discovery, pairing requests
 │   ├── relay/               # Coordination server implementation
-│   ├── retry/               # Exponential backoff with jitter
 │   ├── store/               # Pure-Go SQLite persistence
 │   ├── syncer/              # Folder scanner, watcher, puller, versioner, .gensignore
 │   └── webapi/              # REST API, WebSocket events & static UI serving
 ├── web/                     # React + TypeScript + Tailwind Web UI
+├── relay-web/               # React + TypeScript Relay Admin Web UI
+├── desktop/                 # Tauri Windows desktop app (daemon sidecar + tray)
+├── drop-desktop/            # Tauri Windows QuickDrop app (drop sidecar + tray)
+├── relay-desktop/           # Tauri Windows relay server app (relay sidecar + tray)
 ├── deploy/                  # Dockerfiles, Docker Compose, systemd unit, TrueNAS SCALE metadata
 └── _archive_v1/             # Archived Rust / Node.js v1 prototype
 ```
@@ -104,6 +107,11 @@ Or on Linux/macOS using the `Makefile`:
 ```bash
 make build
 ```
+
+> **Note (local build)**: `web/dist/` contains a placeholder `index.html` so the
+> daemon binary compiles even without a JS toolchain. For the full UI, build the
+> frontend first (`cd web && npm install && npm run build`), then run `go build`
+> — the daemon embeds whatever is in `web/dist/` at compile time.
 
 ---
 

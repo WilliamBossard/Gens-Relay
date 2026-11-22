@@ -65,7 +65,18 @@ func (s *Server) AdminHandler() http.Handler {
 		}))
 	}
 
-	return s.adminAuthMiddleware(s.adminOriginMiddleware(mux))
+	return s.adminSecurityHeaders(s.adminAuthMiddleware(s.adminOriginMiddleware(mux)))
+}
+
+func (s *Server) adminSecurityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'")
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "no-referrer")
+		next.ServeHTTP(w, r)
+	})
 }
 
 func remoteHostIP(r *http.Request) net.IP {
@@ -114,7 +125,13 @@ func isAllowedAdminOrigin(origin, host string) bool {
 func (s *Server) adminOriginMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodDelete || r.Method == http.MethodPatch {
-			if origin := r.Header.Get("Origin"); origin != "" && !isAllowedAdminOrigin(origin, r.Host) {
+			if origin := r.Header.Get("Origin"); origin != "" {
+				if !isAllowedAdminOrigin(origin, r.Host) {
+					writeAdminError(w, http.StatusForbidden, "cross-origin request forbidden")
+					return
+				}
+			} else if r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+				// Browser request with no Origin but declared cross-site: reject (CSRF defense-in-depth).
 				writeAdminError(w, http.StatusForbidden, "cross-origin request forbidden")
 				return
 			}
@@ -518,6 +535,7 @@ func (s *Server) handleAdminUpdateConfig(w http.ResponseWriter, r *http.Request)
 		AdminUser          *string `json:"admin_user"`
 		AdminPassword      string  `json:"admin_password"`
 		ClearAdminPassword bool    `json:"clear_admin_password"`
+		CurrentPassword    string  `json:"current_password"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeAdminError(w, http.StatusBadRequest, err.Error())
@@ -551,6 +569,17 @@ func (s *Server) handleAdminUpdateConfig(w http.ResponseWriter, r *http.Request)
 	}
 
 	if body.ClearAdminPassword {
+		// Effacer le mot de passe admin est une action sensible : exiger la
+		// ré-authentification explicite (current_password) avant d'effacer.
+		if body.CurrentPassword == "" {
+			writeAdminError(w, http.StatusBadRequest, "current_password requis pour effacer le mot de passe admin")
+			return
+		}
+		cSnap := s.cfg.Snapshot()
+		if cSnap.AdminPassHash != "" && !s.cfg.VerifyAdminAuth(cSnap.AdminUser, body.CurrentPassword) {
+			writeAdminError(w, http.StatusUnauthorized, "mot de passe admin actuel incorrect")
+			return
+		}
 		_ = s.cfg.SetAdminPassword("")
 	} else if body.AdminPassword != "" {
 		if err := s.cfg.SetAdminPassword(body.AdminPassword); err != nil {

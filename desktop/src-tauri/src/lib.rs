@@ -86,13 +86,15 @@ fn read_daemon_web_target() -> (String, String, bool) {
     let mut tls = false;
     if let Some(dir) = daemon_data_dir() {
         if let Ok(raw) = std::fs::read_to_string(dir.join("config.json")) {
-            if let Some(val) = extract_json_string(&raw, "web_listen") {
-                if !val.trim().is_empty() {
-                    addr = val.trim().to_string();
+            if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if let Some(val) = cfg.get("web_listen").and_then(|v| v.as_str()) {
+                    if !val.trim().is_empty() {
+                        addr = val.trim().to_string();
+                    }
                 }
-            }
-            if extract_json_bool(&raw, "web_tls").unwrap_or(false) {
-                tls = true;
+                if cfg.get("web_tls").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    tls = true;
+                }
             }
         }
     }
@@ -110,95 +112,6 @@ fn read_daemon_web_target() -> (String, String, bool) {
     (connect_addr, url, tls)
 }
 
-fn find_json_value_start<'a>(raw: &'a str, key: &str) -> Option<&'a str> {
-    let bytes = raw.as_bytes();
-    let mut i = 0;
-    let mut depth = 0usize;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'{' => {
-                depth += 1;
-                i += 1;
-            }
-            b'}' => {
-                depth = depth.saturating_sub(1);
-                i += 1;
-            }
-            b'"' => {
-                i += 1;
-                let start = i;
-                let mut escaped = false;
-                while i < bytes.len() {
-                    if escaped {
-                        escaped = false;
-                        i += 1;
-                        continue;
-                    }
-                    if bytes[i] == b'\\' {
-                        escaped = true;
-                        i += 1;
-                        continue;
-                    }
-                    if bytes[i] == b'"' {
-                        break;
-                    }
-                    i += 1;
-                }
-                let tok = &raw[start..i.min(bytes.len())];
-                if i < bytes.len() {
-                    i += 1;
-                }
-                if depth == 1 && tok == key {
-                    let rest = raw[i..].trim_start();
-                    if let Some(after_colon) = rest.strip_prefix(':') {
-                        return Some(after_colon.trim_start());
-                    }
-                }
-            }
-            _ => i += 1,
-        }
-    }
-    None
-}
-
-fn extract_json_string(raw: &str, key: &str) -> Option<String> {
-    let rest = find_json_value_start(raw, key)?;
-    let mut chars = rest.chars();
-    if chars.next()? != '"' {
-        return None;
-    }
-    let mut out = String::new();
-    let mut escaped = false;
-    for ch in chars {
-        if escaped {
-            match ch {
-                'n' => out.push('\n'),
-                'r' => out.push('\r'),
-                't' => out.push('\t'),
-                other => out.push(other),
-            }
-            escaped = false;
-        } else if ch == '\\' {
-            escaped = true;
-        } else if ch == '"' {
-            return Some(out);
-        } else {
-            out.push(ch);
-        }
-    }
-    None
-}
-
-fn extract_json_bool(raw: &str, key: &str) -> Option<bool> {
-    let rest = find_json_value_start(raw, key)?;
-    if rest.starts_with("true") {
-        Some(true)
-    } else if rest.starts_with("false") {
-        Some(false)
-    } else {
-        None
-    }
-}
 
 fn read_shutdown_token() -> Option<String> {
     let dir = daemon_data_dir()?;
@@ -209,20 +122,7 @@ fn read_shutdown_token() -> Option<String> {
 }
 
 fn json_escape_str(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for ch in s.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
 }
 
 fn show_main_window(app_handle: &AppHandle) {

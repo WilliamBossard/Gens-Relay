@@ -7,7 +7,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -75,7 +75,7 @@ func StartNATMapping(ctx context.Context, quicPort int) (stop func()) {
 				mu.Unlock()
 				if !loggedSuccess {
 					loggedSuccess = true
-					log.Printf("[p2p] NAT port mapping active via UPnP-IGD (UDP :%d)", quicPort)
+					slog.Info("NAT port mapping active via UPnP-IGD", "port", quicPort)
 				}
 				return
 			}
@@ -88,7 +88,7 @@ func StartNATMapping(ctx context.Context, quicPort int) (stop func()) {
 				mu.Unlock()
 				if !loggedSuccess {
 					loggedSuccess = true
-					log.Printf("[p2p] NAT port mapping active via NAT-PMP (UDP :%d via %s)", quicPort, gw.String())
+					slog.Info("NAT port mapping active via NAT-PMP", "port", quicPort, "gateway", gw.String())
 				}
 			}
 		}

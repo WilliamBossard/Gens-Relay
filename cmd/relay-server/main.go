@@ -5,8 +5,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"flag"
-	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -22,7 +22,6 @@ import (
 
 func main() {
 	logRing := logs.NewRingBuffer(500, nil)
-	log.SetOutput(io.MultiWriter(os.Stderr, logRing))
 
 	dataDirFlag := flag.String("data-dir", relay.DefaultDataDir(), "Relay config & state directory")
 	listenAddr := flag.String("listen", os.Getenv("RELAY_LISTEN"), "HTTP/WebSocket listen address (default :38420)")
@@ -38,6 +37,7 @@ func main() {
 	flag.Parse()
 
 	dataDir := *dataDirFlag
+	logs.Setup("info", "text", filepath.Join(dataDir, "relay-server.log"), logRing)
 	if dataDir != "" {
 		instLock, err := lock.Acquire(dataDir)
 		if err != nil {
@@ -102,14 +102,14 @@ func main() {
 	}
 
 	if err := srv.StartUDP(ctx, snap.ListenAddr); err != nil {
-		log.Printf("[relay-server] UDP STUN/Relay listener disabled (%v)", err)
+		slog.Warn("UDP STUN/Relay listener disabled", "err", err)
 	} else {
-		log.Printf("[relay-server] UDP STUN & Native Blind Relay active on %s/udp", snap.ListenAddr)
+		slog.Info("UDP STUN & Native Blind Relay active", "addr", snap.ListenAddr+"/udp")
 	}
 
 	useTLS := *tlsCert != "" && *tlsKey != ""
 	go func() {
-		log.Printf("[relay-server] Listening on %s (tls=%v, blind_relay=%v, stores_files=false)", snap.ListenAddr, useTLS, snap.EnableBlindRelay)
+	slog.Info("relay server listening", "addr", snap.ListenAddr, "tls", useTLS, "blind_relay", snap.EnableBlindRelay, "stores_files", false)
 		var sErr error
 		if useTLS {
 			sErr = httpServer.ListenAndServeTLS(*tlsCert, *tlsKey)
@@ -123,13 +123,13 @@ func main() {
 
 	if adminServer != nil {
 		go func() {
-			log.Printf("[relay-server] Admin Web UI listening on http://%s", snap.AdminListen)
+			slog.Info("admin Web UI listening", "addr", snap.AdminListen)
 			if err := adminServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				log.Printf("[relay-server] admin server error: %v", err)
+				slog.Error("admin server error", "err", err)
 			}
 		}()
 	} else {
-		log.Printf("[relay-server] Admin Web UI mounted at %s/admin/", snap.ListenAddr)
+		slog.Info("admin Web UI mounted", "addr", snap.ListenAddr+"/admin/")
 	}
 
 	<-ctx.Done()

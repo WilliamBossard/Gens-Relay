@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -29,6 +30,7 @@ func main() {
 	baseURL := flag.String("url", "", "Override daemon Web API base URL (e.g. http://127.0.0.1:8384)")
 	userFlag := flag.String("user", os.Getenv("GENS_WEB_USER"), "Web UI username if authentication is enabled")
 	passFlag := flag.String("pass", os.Getenv("GENS_WEB_PASS"), "Web UI password if authentication is enabled")
+	insecureFlag := flag.Bool("insecure", false, "Désactiver la vérification TLS du daemon (non recommandé : par défaut, le certificat web-cert.pem du data-dir est exigé)")
 	flag.Parse()
 
 	args := flag.Args()
@@ -37,11 +39,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	c := buildClient(*dataDir, *baseURL, *userFlag, *passFlag)
+	c, err := buildClient(*dataDir, *baseURL, *userFlag, *passFlag, *insecureFlag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gens-drop: %v\n", err)
+		os.Exit(1)
+	}
 	cmd := strings.ToLower(args[0])
 	rest := args[1:]
 
-	var err error
 	switch cmd {
 	case "status":
 		err = cmdStatus(c)
@@ -78,7 +83,7 @@ func printUsage() {
 	flag.PrintDefaults()
 }
 
-func buildClient(dataDir, overrideURL, user, pass string) *cliConfig {
+func buildClient(dataDir, overrideURL, user, pass string, insecure bool) (*cliConfig, error) {
 	resolvedURL := strings.TrimRight(strings.TrimSpace(overrideURL), "/")
 	useTLS := false
 	detectedUser := user
@@ -120,8 +125,25 @@ func buildClient(dataDir, overrideURL, user, pass string) *cliConfig {
 
 	tr := &http.Transport{}
 	if useTLS {
-		// Local daemon uses a self-signed certificate stored in dataDir
-		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+		// The local daemon uses a self-signed certificate stored in dataDir.
+		// Pin it (RootCAs) instead of skipping verification entirely — an
+		// InsecureSkipVerify client would hand Basic Auth credentials to any
+		// MITM on the path.
+		caFile := filepath.Join(dataDir, "web-cert.pem")
+		certPEM, readErr := os.ReadFile(caFile)
+		switch {
+		case readErr == nil:
+			pool := x509.NewCertPool()
+			if !pool.AppendCertsFromPEM(certPEM) {
+				return nil, fmt.Errorf("certificat %s illisible (PEM invalide)", caFile)
+			}
+			tr.TLSClientConfig = &tls.Config{RootCAs: pool}
+		case insecure:
+			fmt.Fprintln(os.Stderr, "gens-drop: --insecure activé — vérification TLS désactivée (non recommandé)")
+			tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+		default:
+			return nil, fmt.Errorf("connexion TLS au daemon impossible : certificat %s introuvable. Copiez web-cert.pem du data-dir du daemon, ou passez --insecure pour désactiver la vérification (non recommandé)", caFile)
+		}
 	}
 
 	return &cliConfig{
@@ -132,7 +154,7 @@ func buildClient(dataDir, overrideURL, user, pass string) *cliConfig {
 			Timeout:   30 * time.Second,
 			Transport: tr,
 		},
-	}
+	}, nil
 }
 
 func (c *cliConfig) doJSON(method, path string, reqBody any, out any) error {

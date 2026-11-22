@@ -6,8 +6,8 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"flag"
-	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -30,7 +30,6 @@ import (
 
 func main() {
 	logRing := logs.NewRingBuffer(500, nil)
-	log.SetOutput(io.MultiWriter(os.Stderr, logRing))
 
 	dataDirFlag := flag.String("data-dir", config.DefaultDataDir(), "Daemon config & state directory")
 	webListenFlag := flag.String("web", "", "Override Web UI listen address (e.g. 0.0.0.0:8385)")
@@ -55,6 +54,10 @@ func main() {
 	if *webTLSFlag {
 		_ = cfg.Update(func(c *config.DaemonConfig) { c.WebTLS = true })
 	}
+
+	// Structured logging: stderr + Web UI ring buffer + dataDir/gens-relay.log
+	snapCfg := cfg.Snapshot()
+	logs.Setup(snapCfg.LogLevel, snapCfg.LogFormat, filepath.Join(dataDir, "gens-relay.log"), logRing)
 
 	id, err := protocol.LoadOrCreateIdentity(dataDir)
 	if err != nil {
@@ -234,6 +237,13 @@ func main() {
 
 	snap := cfg.Snapshot()
 	webAddr := snap.WebListen
+	// Guard: never expose the Web UI on a non-loopback interface without
+	// authentication — a loud, unmissable warning at startup.
+	webHost := strings.Trim(strings.TrimPrefix(strings.SplitN(webAddr, ":", 2)[0], "["), "]")
+	if webHost != "127.0.0.1" && webHost != "::1" && webHost != "localhost" &&
+		(snap.WebUser == "" || snap.WebPassHash == "") {
+		slog.Warn("web UI exposed without authentication — set web_user/web_pass before exposing beyond loopback", "addr", webAddr)
+	}
 	httpSrv := &http.Server{
 		Addr:              webAddr,
 		Handler:           apiSrv.Handler(),
@@ -241,19 +251,19 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("[gens-daemon] DeviceID: %s", id.DeviceID)
+	slog.Info("daemon starting", "device", id.DeviceID)
 		if snap.WebTLS {
 			certPath, keyPath, err := webapi.EnsureWebCert(dataDir)
 			if err != nil {
 				log.Fatalf("[gens-daemon] web TLS cert error: %v", err)
 			}
-			log.Printf("[gens-daemon] Web UI listening on https://%s", webAddr)
+			slog.Info("Web UI listening (https)", "addr", webAddr)
 			if err := httpSrv.ListenAndServeTLS(certPath, keyPath); err != nil && err != http.ErrServerClosed {
 				log.Fatalf("[gens-daemon] web server fatal: %v", err)
 			}
 			return
 		}
-		log.Printf("[gens-daemon] Web UI listening on http://%s", webAddr)
+		slog.Info("Web UI listening (http)", "addr", webAddr)
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("[gens-daemon] web server fatal: %v", err)
 		}

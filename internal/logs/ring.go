@@ -38,10 +38,20 @@ func (r *RingBuffer) SetCallback(fn func(Entry)) {
 	r.mu.Unlock()
 }
 
+// maxPartialBytes bounds the pending (not yet newline-terminated) log data so
+// a single overlong line cannot grow the buffer without limit.
+const maxPartialBytes = 1 << 20 // 1 MiB
+
 func (r *RingBuffer) Write(p []byte) (int, error) {
 	r.mu.Lock()
 	r.partial = append(r.partial, p...)
 	var emitted []Entry
+	if len(r.partial) > maxPartialBytes {
+		// Flush what we have as a truncated entry and drop the overflow so a
+		// runaway newline-less writer cannot exhaust memory.
+		emitted = append(emitted, r.addEntry(string(r.partial[:maxPartialBytes])+" … [ligne tronquée : > 1 Mio sans retour chariot]"))
+		r.partial = nil
+	}
 	for {
 		idx := bytes.IndexByte(r.partial, '\n')
 		if idx < 0 {
@@ -52,17 +62,7 @@ func (r *RingBuffer) Write(p []byte) (int, error) {
 		if line == "" {
 			continue
 		}
-		r.nextID++
-		e := Entry{
-			ID:        r.nextID,
-			Timestamp: time.Now().Unix(),
-			Message:   line,
-		}
-		r.entries = append(r.entries, e)
-		if len(r.entries) > r.max {
-			r.entries = r.entries[len(r.entries)-r.max:]
-		}
-		emitted = append(emitted, e)
+		emitted = append(emitted, r.addEntry(line))
 	}
 	cb := r.onEntry
 	r.mu.Unlock()
@@ -73,6 +73,21 @@ func (r *RingBuffer) Write(p []byte) (int, error) {
 		}
 	}
 	return len(p), nil
+}
+
+// addEntry appends a log line to the ring. Caller must hold r.mu.
+func (r *RingBuffer) addEntry(line string) Entry {
+	r.nextID++
+	e := Entry{
+		ID:        r.nextID,
+		Timestamp: time.Now().Unix(),
+		Message:   line,
+	}
+	r.entries = append(r.entries, e)
+	if len(r.entries) > r.max {
+		r.entries = r.entries[len(r.entries)-r.max:]
+	}
+	return e
 }
 
 func (r *RingBuffer) List() []Entry {

@@ -1,4 +1,4 @@
-import { StagedBrowserFile } from "./types";
+import { Bootstrap, StagedBrowserFile } from "./types";
 
 export async function apiFetch(url: string, opts?: RequestInit) {
   const headers: Record<string, string> = {};
@@ -14,6 +14,15 @@ export async function apiFetch(url: string, opts?: RequestInit) {
     throw new Error(data.error || `HTTP ${res.status}`);
   }
   return data;
+}
+
+// fetchBootstrap appelle l'endpoint agrégé GET /api/v1/bootstrap : une seule
+// requête réseau remplace les 11 requêtes parallèles de lecture (status,
+// devices, peers, nearby, pair-requests, folders, folder-status,
+// invitations, drops, logs, companion-apps). Les endpoints individuels
+// restent disponibles pour les actions POST/PUT et les refresh ciblés.
+export async function fetchBootstrap(): Promise<Bootstrap> {
+  return apiFetch("/api/v1/bootstrap");
 }
 
 export async function collectDroppedItems(items: DataTransferItemList): Promise<StagedBrowserFile[]> {

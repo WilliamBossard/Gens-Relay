@@ -19,7 +19,7 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' http://127.0.0.1:8385 http://localhost:8385 https://127.0.0.1:8385 https://localhost:8385; font-src 'self' data:"
     }
   },
   "bundle": {

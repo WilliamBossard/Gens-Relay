@@ -32,6 +32,8 @@ type Settings struct {
 	DropInboxDir      string   `json:"drop_inbox_dir"`
 	MaxUploadKBps     int      `json:"max_upload_kbps"`   // 0 = unlimited
 	MaxDownloadKBps   int      `json:"max_download_kbps"` // 0 = unlimited
+	LogLevel          string   `json:"log_level"`         // debug|info|warn|error
+	LogFormat         string   `json:"log_format"`        // text|json
 }
 
 // EffectiveRelayURLs returns the normalized deduplicated list of configured relay URLs.
@@ -120,6 +122,8 @@ func LoadOrCreateDaemonConfig(dataDir string) (*DaemonConfig, error) {
 			EnableCompression: true,
 			WebListen:         envOr("GENS_WEB_LISTEN", "127.0.0.1:8385"),
 			DropInboxDir:      DefaultDropInbox(dataDir),
+			LogLevel:          envOr("GENS_LOG_LEVEL", "info"),
+			LogFormat:         envOr("GENS_LOG_FORMAT", "text"),
 		},
 		filePath: cfgPath,
 	}
